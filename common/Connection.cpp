@@ -21,6 +21,7 @@ Connection::Connection(Eventloop *_loop, Socket *_sock)
     channel_->setWriteCallback(std::bind(&Connection::handleWrite, this));
     channel_->enableReading();
     channel_->enableET();
+    state_ = State::kConnected;
 }
 
 Connection::~Connection() {
@@ -36,19 +37,25 @@ void Connection::handleRead() {
     if (n > 0) {
         // 读到了数据，业务逻辑处理
         // 不再硬编码 Echo 业务
-        if (onMessageCallback_)
-            onMessageCallback_(this);
+        if (onConnectCallback_)
+            onConnectCallback_(this);
     } else if (n == 0) {
+        state_ = State::kClosed;
+        onConnectCallback_(this);
         std::cout << "[server] client fd " << sockfd << " disconnected." << std::endl;
-        // 关键：连接断开时，通过回调通知 Server 移除自己
-        if (deleteConnectionCallback_)
-            deleteConnectionCallback_(sock_);
     } else {
+        state_ = State::kFailed;
+        onConnectCallback_(this);
         std::cerr << "[server] read error on fd " << sockfd << ": " << strerror(savedErrno)
                   << std::endl;
-        if (deleteConnectionCallback_)
-            deleteConnectionCallback_(sock_);
     }
+}
+
+Connection::State Connection::getState() const { return state_; }
+
+void Connection::close() {
+    if (deleteConnectionCallback_)
+        deleteConnectionCallback_(sock_);
 }
 
 void Connection::handleWrite() {
@@ -103,8 +110,8 @@ void Connection::setDeleteConnectionCallback(std::function<void(Socket *)> _cb) 
     deleteConnectionCallback_ = _cb;
 }
 
-void Connection::setOnMessageCallback(std::function<void(Connection *)> const &_cb) {
-    onMessageCallback_ = _cb;
+void Connection::setOnConnectCallback(std::function<void(Connection *)> const &_cb) {
+    onConnectCallback_ = _cb;
 }
 
 Buffer *Connection::readBuffer() { return &inputBuffer_; }

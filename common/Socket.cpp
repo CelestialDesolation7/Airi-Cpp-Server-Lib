@@ -42,3 +42,5 @@ void Socket::setnonblocking() {
     int new_option = oldoptions | O_NONBLOCK;
     fcntl(fd_, F_SETFL, new_option);
 }
+
+bool Socket::isNonBlocking() { return (fcntl(fd_, F_GETFL) & O_NONBLOCK) != 0; }

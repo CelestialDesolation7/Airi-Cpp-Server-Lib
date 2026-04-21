@@ -7,6 +7,7 @@
 #include "Socket.h"
 #include "ThreadPool.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -60,15 +61,7 @@ void Server::newConnection(Socket *client_sock, InetAddress *client_addr) {
     // day 12 修改：连接被绑定至 subReactor
     Connection *conn = new Connection(ioLoop, client_sock);
 
-    // 定义一个 lambda 表达式，捕获 this （Server类指针）拿到ThreadPool
-    // 定义 Server socket 的业务逻辑：
-    // 把业务函数写在这里，作为一个Task加入线程池
-    std::function<void(Connection *)> msgCb = [](Connection *conn) {
-        std::string msg = conn->readBuffer()->retrieveAllAsString();
-        std::cout << "[Thread " << std::this_thread::get_id() << "] recv: " << msg << std::endl;
-        conn->send(msg);
-    };
-    conn->setOnMessageCallback(msgCb);
+    conn->setOnConnectCallback(onConnectCallback_);
 
     // deleteConnection 可能在子线程中被调用（连接断开由 SubReactor 检测），
     // 通过 queueInLoop 将实际的删除操作投递到主线程执行，确保 connections_ map 的线程安全。
@@ -96,3 +89,5 @@ void Server::deleteConnection(Socket *sock) {
 
     mainReactor_->queueInLoop(task);
 }
+
+void Server::onConnect(std::function<void(Connection *)> fn) { onConnectCallback_ = std::move(fn); }

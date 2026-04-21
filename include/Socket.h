@@ -24,4 +24,6 @@ class Socket {
     int getFd();
 
     void setnonblocking();
+
+    bool isNonBlocking();
 };
