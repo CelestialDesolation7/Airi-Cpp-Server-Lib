@@ -1,29 +1,34 @@
-# Day 05 — Channel 抽象
+# Day 06 — EventLoop + Server + Channel 回调
 
 ## 项目状态
 
-在 Day 04（Socket / InetAddress / Epoll 封装）基础上，引入 **Channel** 类：
+在 Day 05（Channel 封装）基础上，引入 **EventLoop** 和 **Server** 类：
 
-- `Channel` 将 fd、关注事件（events）、返回事件（revents）封装为一个对象
-- `Epoll::poll()` 返回 `vector<Channel*>`，不再暴露底层事件结构体
-- `Socket::setnonblocking()` 从 `util` 移入 Socket 类
+- `Eventloop` 封装 poll → handleEvent 事件循环
+- `Server` 封装 Socket 初始化 + accept + 客户端 Channel 创建
+- `Channel` 新增 `callback` / `setCallback()` / `handleEvent()` 回调机制
+- `server.cpp` 精简为创建 EventLoop + Server + loop()
 
 ## 文件结构
 
 ```
-day05/
+day06/
 ├── CMakeLists.txt
-├── server.cpp          ← Channel 驱动的事件循环 + echo
+├── server.cpp          ← 仅 new EventLoop → new Server → loop()
 ├── client.cpp          ← 交互式客户端
 ├── include/
-│   ├── Channel.h       ← 新增：fd + events + revents + inEpoll
-│   ├── Epoll.h         ← 改为返回 vector<Channel*>
-│   ├── Socket.h        ← 新增 setnonblocking()
+│   ├── EventLoop.h     ← 新增
+│   ├── Server.h        ← 新增
+│   ├── Channel.h       ← 新增 callback + handleEvent()
+│   ├── Epoll.h
+│   ├── Socket.h
 │   ├── InetAddress.h
 │   └── util.h
 └── common/
-    ├── Channel.cpp     ← 新增
-    ├── Epoll.cpp       ← kqueue(macOS)/epoll(Linux) 双路径
+    ├── Eventloop.cpp   ← 新增
+    ├── Server.cpp      ← 新增
+    ├── Channel.cpp     ← 修改
+    ├── Epoll.cpp
     ├── Socket.cpp
     ├── InetAddress.cpp
     └── util.cpp
@@ -44,5 +49,5 @@ cmake --build build
 
 ## 已知问题
 
-- `client_sock` / `client_addr` 在每次 accept 后 new 但未 delete（内存泄漏）
-- 事件处理逻辑硬编码在 main 的 for 循环中，无回调机制
+- client_sock / clientChannel 仍有内存泄漏
+- accept 逻辑耦合在 Server::handleReadEvent()，无独立 Acceptor

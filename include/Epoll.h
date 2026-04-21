@@ -9,7 +9,6 @@
 #include <sys/epoll.h>
 #endif
 
-// 平台标志常量
 #ifdef __APPLE__
 constexpr uint32_t POLLER_READ = 1;
 constexpr uint32_t POLLER_ET   = 2;

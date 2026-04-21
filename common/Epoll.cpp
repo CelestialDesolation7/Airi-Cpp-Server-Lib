@@ -49,7 +49,7 @@ std::vector<Channel *> Epoll::poll(int timeout) {
   return activeChannels;
 }
 
-#else // Linux epoll
+#else
 
 Epoll::Epoll() : epfd(-1), events(nullptr) {
   epfd = epoll_create1(0);
