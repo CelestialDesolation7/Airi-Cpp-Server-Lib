@@ -14,7 +14,10 @@
 #include <fcntl.h>
 #endif
 
-Eventloop::Eventloop() : poller_(nullptr), quit_(false) {
+Eventloop::Eventloop() : poller_(nullptr), quit_(false), tid_(std::this_thread::get_id()) {
+    // tid_ 在此捕获：调用构造函数的线程即为本 EventLoop 的归属线程。
+    // 配合 EventLoopThread 使用后，构造和 loop() 调用均在同一子线程，
+    // isInLoopThread() 的判断结果永远正确。
     poller_ = Poller::newDefaultPoller(this); // 工厂返回 unique_ptr，直接 move 赋值
 
 #ifdef __linux__
@@ -99,3 +102,15 @@ void Eventloop::doPendingFunctors() {
 void Eventloop::updateChannel(Channel *ch) { poller_->updateChannel(ch); }
 void Eventloop::deleteChannel(Channel *ch) { poller_->deleteChannel(ch); }
 void Eventloop::setQuit() { quit_ = true; }
+
+bool Eventloop::isInLoopThread() const { return tid_ == std::this_thread::get_id(); }
+
+void Eventloop::runInLoop(std::function<void()> func) {
+    if (isInLoopThread()) {
+        // 当前线程即本 EventLoop 的归属线程，直接执行，无需排队
+        func();
+    } else {
+        // 跨线程调用：投递到 pendingFunctors_，由归属线程在下次 doPendingFunctors() 时执行
+        queueInLoop(std::move(func));
+    }
+}

@@ -3,25 +3,33 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
-#include <vector>
 
 class Connection;
 class Eventloop;
 class Acceptor;
-class ThreadPool;
+class EventLoopThreadPool;
 
 class TcpServer {
     DISALLOW_COPY_AND_MOVE(TcpServer)
   private:
     std::unique_ptr<Eventloop> mainReactor_;
     std::unique_ptr<Acceptor> acceptor_;
-    // 声明顺序决定析构的逆序：threadPool_ 最先析构（join 线程），
-    // connections_ 其次（Connection 析构调用 loop_->deleteChannel()），
-    // subReactors_ 最后析构（此时 EventLoop/kqueue fd 仍然有效）。
-    // 若 connections_ 在 subReactors_ 之后析构，loop_ 是野指针，必然段错误。
-    std::vector<std::unique_ptr<Eventloop>> subReactors_;
+
+    // ── 析构顺序说明（C++ 成员按声明逆序析构）──────────────────────────────
+    // 声明顺序：mainReactor_(1) → acceptor_(2) → threadPool_(3) → connections_(4)
+    // 析构顺序：connections_(1st) → threadPool_(2nd) → acceptor_(3rd) → mainReactor_(4th)
+    //
+    // 但 connections_ 析构时 Connection::~Connection() 会调 loop->deleteChannel()，
+    // 此时要求：① IO 线程已退出（无竞态）；② EventLoop 对象仍然存活（不是野指针）。
+    //
+    // 满足条件的方式：
+    //   ~TcpServer() 先显式调 threadPool_->joinAll()（join 线程但不销毁 EventLoop），
+    //   然后成员按逆序自动析构：
+    //     connections_ 析构：IO 线程已 join，EventLoop 存活于 threadPool_ 中 ✓
+    //     threadPool_  析构：EventLoopThread 析构 → join(no-op) → EventLoop 最终销毁 ✓
+    // ────────────────────────────────────────────────────────────────────────
+    std::unique_ptr<EventLoopThreadPool> threadPool_;
     std::unordered_map<int, std::unique_ptr<Connection>> connections_;
-    std::unique_ptr<ThreadPool> threadPool_;
 
     std::function<void(Connection *)> onMessageCallback_;
     std::function<void(Connection *)> newConnectCallback_;
@@ -30,8 +38,8 @@ class TcpServer {
     TcpServer();
     ~TcpServer();
 
-    void Start(); // 启动所有 subReactor 线程和 mainReactor 循环
-    void stop();  // 安全关闭：令所有 Reactor 退出循环
+    void Start(); // 启动所有 sub-reactor 线程和 main-reactor 循环
+    void stop();  // 令所有 Reactor 退出循环
 
     void newConnection(int fd);
     void deleteConnection(int fd);

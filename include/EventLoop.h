@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <sys/types.h>
+#include <thread>
 #include <vector>
 
 class Poller;
@@ -20,6 +21,11 @@ class Eventloop {
     std::atomic<bool> quit_{false};
     std::vector<std::function<void()>> pendingFunctors_;
     std::mutex mutex_;
+
+    // 构造时捕获当前线程 ID，用于 isInLoopThread() 判断。
+    // 配合 EventLoopThread 使用后，EventLoop 在其归属线程内构造，
+    // tid_ 始终与运行 loop() 的线程一致。
+    std::thread::id tid_;
 
 #ifdef __linux__
     int evtfd_{-1};
@@ -40,4 +46,11 @@ class Eventloop {
     void deleteChannel(Channel *ch);
     void queueInLoop(std::function<void()> func);
     void wakeup();
+
+    // 判断调用方是否在本 EventLoop 所属的线程中
+    bool isInLoopThread() const;
+
+    // 若当前在 EventLoop 线程中，立即执行 func；
+    // 否则通过 queueInLoop 跨线程投递，等待下一次 doPendingFunctors() 执行。
+    void runInLoop(std::function<void()> func);
 };

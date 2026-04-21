@@ -2,9 +2,10 @@
 #include "Acceptor.h"
 #include "Connection.h"
 #include "EventLoop.h"
+#include "EventLoopThreadPool.h"
 #include "Exception.h"
-#include "ThreadPool.h"
 
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <thread>
@@ -16,21 +17,21 @@ TcpServer::TcpServer() {
     acceptor_->setNewConnectionCallback(
         std::bind(&TcpServer::newConnection, this, std::placeholders::_1));
 
-    int threadNum = static_cast<int>(std::thread::hardware_concurrency());
-    threadPool_ = std::make_unique<ThreadPool>(threadNum);
-
-    for (int i = 0; i < threadNum; ++i)
-        subReactors_.push_back(std::make_unique<Eventloop>());
+    // 至少 1 个 IO 线程；hardware_concurrency() 可能返回 0
+    int threadNum = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    threadPool_ = std::make_unique<EventLoopThreadPool>(mainReactor_.get());
+    threadPool_->setThreadNums(threadNum);
 
     std::cout << "[TcpServer] Main Reactor + " << threadNum << " Sub Reactors ready." << std::endl;
 }
 
 void TcpServer::Start() {
-    // 启动所有 subReactor 线程
-    for (auto &sub : subReactors_)
-        threadPool_->add(std::bind(&Eventloop::loop, sub.get()));
+    // 1. 启动所有 IO 线程：每个线程在内部构造 EventLoop 并进入 loop()
+    //    start() 内部同步等待每个 EventLoop 就绪后才返回，
+    //    此后 nextLoop() 可安全使用
+    threadPool_->start();
 
-    // 主线程进入 main reactor 循环（阻塞直到 setQuit）
+    // 2. 主线程进入 main-reactor 循环（阻塞直到 stop()）
     mainReactor_->loop();
 }
 
@@ -38,47 +39,49 @@ void TcpServer::newConnection(int fd) {
     if (fd == -1)
         throw Exception(ExceptionType::INVALID_SOCKET, "newConnection: invalid fd");
 
-    int idx = fd % static_cast<int>(subReactors_.size());
-    auto conn = std::make_unique<Connection>(fd, subReactors_[idx].get());
+    // 轮询选择一个 sub-reactor 归属这条连接
+    Eventloop *subLoop = threadPool_->nextLoop();
+    auto conn = std::make_unique<Connection>(fd, subLoop);
 
-    // 先设置所有回调，再启用 Channel，避免回调尚未就绪就触发事件
+    // 先注入所有回调，再通过 queueInLoop 在归属 sub-reactor 线程启用 Channel，
+    // 避免 Channel 就绪触发事件时回调尚未设置
     conn->setOnMessageCallback(onMessageCallback_);
     conn->setDeleteConnectionCallback(
         std::bind(&TcpServer::deleteConnection, this, std::placeholders::_1));
 
     Connection *rawConn = conn.get();
-    connections_[fd] = std::move(conn); // unique_ptr 转移进 map
+    connections_[fd] = std::move(conn);
 
     if (newConnectCallback_)
         newConnectCallback_(rawConn);
 
-    // 通过 queueInLoop 在子 reactor 线程启用 Channel，
-    // 确保所有回调已就绪且 Connection 已进入 map
-    subReactors_[idx]->queueInLoop([rawConn]() { rawConn->enableInLoop(); });
+    // queueInLoop 跨线程投递：在 sub-reactor 线程启用读事件（enableInLoop），
+    // 此时 connections_[fd] 已插入 map，回调均已就绪
+    subLoop->queueInLoop([rawConn]() { rawConn->enableInLoop(); });
 
     std::cout << "[TcpServer] new connection fd=" << fd << std::endl;
 }
 
 void TcpServer::deleteConnection(int fd) {
-    // 在主 reactor 线程操作 connections_ map（线程安全），
-    // 但将 Connection 的实际销毁转移到其所属的子 reactor 线程执行，
-    // 避免主 reactor 线程析构 Channel 时子 reactor 仍持有其指针（use-after-free）
+    // 本函数由 sub-reactor 线程经 Connection::close() 回调链调用，
+    // 需切换到 main-reactor 线程操作 connections_ map（逻辑隔离，无需 mutex）
     mainReactor_->queueInLoop([this, fd]() {
         auto it = connections_.find(fd);
         if (it != connections_.end()) {
             Eventloop *ioLoop = it->second->getLoop();
-            // 将 Connection 所有权从 map 移出
             std::unique_ptr<Connection> conn = std::move(it->second);
             connections_.erase(it);
             std::cout << "[TcpServer] connection fd=" << fd << " deleted." << std::endl;
 
-            // 移交到子 reactor 线程销毁：在 doPendingFunctors() 中执行，
-            // 此时当前 poll() 返回的所有事件已处理完毕，Channel* 不再被引用。
-            // 用 shared_ptr 包装 unique_ptr 以满足 std::function 对可复制性的要求，
-            // 无需手动 release() + delete，析构由 shared_ptr 引用计数自动触发。
+            // 将 Connection 析构投递到其归属 sub-reactor 线程执行：
+            // 保证 Connection::~Connection()（调用 loop_->deleteChannel）
+            // 发生在该 sub-reactor 本次 poll() 结束、events_ 遍历完毕之后，
+            // 消除 Channel* 悬空野指针风险。
+            // shared_ptr 包装 unique_ptr：满足 std::function 对可复制性的要求，
+            // 引用计数归零时自动析构 Connection，无需 release()+delete。
             std::shared_ptr<Connection> guard(std::move(conn));
             ioLoop->queueInLoop([guard]() {
-                // guard 在此作用域结束时析构，引用计数归零，Connection 被安全释放
+                // guard 在此作用域结束时析构，Connection 被安全释放
             });
         }
     });
@@ -92,19 +95,18 @@ void TcpServer::newConnect(std::function<void(Connection *)> fn) {
 }
 
 void TcpServer::stop() {
-    // 先令所有子 Reactor 退出 loop()，使工作线程从 kevent/epoll_wait 返回
-    // 回到 ThreadPool 的条件变量等待，这样 threadPool_ 析构时 join() 才不会永久阻塞
-    for (auto &sub : subReactors_) {
-        sub->setQuit();
-        sub->wakeup();
-    }
-    // 令主 Reactor 退出 loop()，Start() 函数得以返回
+    // 通知所有 sub-reactor 退出 loop()
+    threadPool_->stopAll();
+    // 通知 main-reactor 退出 loop()，使 Start() 函数得以返回
     mainReactor_->setQuit();
     mainReactor_->wakeup();
 }
 
 TcpServer::~TcpServer() {
-    // 析构前确保所有 Reactor 已退出，防止 threadPool_ join() 时
-    // 工作线程仍阻塞在 kevent/epoll_wait 内而造成死锁
+    // 1. 令所有 reactor 退出 loop()（幂等，重复调用无害）
     stop();
+    // 2. 显式等待所有 IO 线程实际退出（join），
+    //    之后 connections_ 析构时调用 loop->deleteChannel() 才没有竞态风险
+    threadPool_->joinAll();
+    // 3. 成员按声明逆序自动析构（详见 TcpServer.h 注释）
 }
