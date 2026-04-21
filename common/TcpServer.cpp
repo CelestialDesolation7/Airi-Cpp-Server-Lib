@@ -41,6 +41,7 @@ void TcpServer::newConnection(int fd) {
     int idx = fd % static_cast<int>(subReactors_.size());
     auto conn = std::make_unique<Connection>(fd, subReactors_[idx].get());
 
+    // 先设置所有回调，再启用 Channel，避免回调尚未就绪就触发事件
     conn->setOnMessageCallback(onMessageCallback_);
     conn->setDeleteConnectionCallback(
         std::bind(&TcpServer::deleteConnection, this, std::placeholders::_1));
@@ -51,19 +52,32 @@ void TcpServer::newConnection(int fd) {
     if (newConnectCallback_)
         newConnectCallback_(rawConn);
 
+    // 通过 queueInLoop 在子 reactor 线程启用 Channel，
+    // 确保所有回调已就绪且 Connection 已进入 map
+    subReactors_[idx]->queueInLoop([rawConn]() { rawConn->enableInLoop(); });
+
     std::cout << "[TcpServer] new connection fd=" << fd << std::endl;
 }
 
 void TcpServer::deleteConnection(int fd) {
-    // 必须在主线程执行（确保 connections_ map 线程安全）
-    auto task = [this, fd]() {
+    // 在主 reactor 线程操作 connections_ map（线程安全），
+    // 但将 Connection 的实际销毁转移到其所属的子 reactor 线程执行，
+    // 避免主 reactor 线程析构 Channel 时子 reactor 仍持有其指针（use-after-free）
+    mainReactor_->queueInLoop([this, fd]() {
         auto it = connections_.find(fd);
         if (it != connections_.end()) {
-            connections_.erase(it); // unique_ptr 自动 delete Connection
+            Eventloop *ioLoop = it->second->getLoop();
+            // 将 Connection 所有权从 map 移出
+            std::unique_ptr<Connection> conn = std::move(it->second);
+            connections_.erase(it);
             std::cout << "[TcpServer] connection fd=" << fd << " deleted." << std::endl;
+
+            // 移交到子 reactor 线程销毁：在 doPendingFunctors() 中执行，
+            // 此时当前 poll() 返回的所有事件已处理完毕，Channel* 不再被引用
+            Connection *raw = conn.release();
+            ioLoop->queueInLoop([raw]() { delete raw; });
         }
-    };
-    mainReactor_->queueInLoop(task);
+    });
 }
 
 void TcpServer::onMessage(std::function<void(Connection *)> fn) {

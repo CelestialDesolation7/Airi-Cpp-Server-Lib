@@ -41,6 +41,10 @@ class Connection {
     State getState() const;
     Buffer *getInputBuffer();
     Buffer *getOutputBuffer();
+    Eventloop *getLoop() const;
+
+    // 在所有回调设置完成后，通过 queueInLoop 调用此方法来启用 Channel
+    void enableInLoop();
 
   private:
     State state_{State::kInvalid};

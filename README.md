@@ -1,11 +1,10 @@
-# Day 19 — Server → TcpServer 重命名 + 智能指针改造
+# Day 20 — TcpServer 安全关闭 + 成员析构顺序修正
 
 ## 核心变更
-- **`Server` → `TcpServer`** 重命名，语义更精确
-- **全面 `unique_ptr`**：TcpServer、Acceptor、Connection 内部资源均用智能指针管理
-- **接口简化**：Acceptor 回调从 `void(Socket*, InetAddress*)` 改为 `void(int fd)`；Connection 构造从 `(Eventloop*, Socket*)` 改为 `(int fd, Eventloop*)`
-- **新增 `RC` 返回码枚举**（Macros.h），为后续错误处理改造铺路
-- **`TcpServer::Start()`**：自包含启动方法，内部自建 mainReactor
+- **`TcpServer::stop()`**：优雅关闭，令所有 sub-reactor 和 main-reactor 退出 `loop()`
+- **成员析构顺序修正**：`subReactors_` 声明在 `connections_` 之前，确保 EventLoop 在 Connection 之后析构
+- **`deleteConnection` 改用 `shared_ptr` guard**：将 Connection 析构投递到归属子线程，消除 Channel 悬空指针
+- **栈对象 + RAII**：`server.cpp` 中 `TcpServer` 改为栈对象，SIGINT 调 `stop()` 而非 `delete`
 
 ## 构建
 
@@ -21,16 +20,14 @@ cmake --build build -j4
 ```
 ├── server.cpp / client.cpp         入口
 ├── include/
-│   ├── TcpServer.h                 替代 Server.h（新增）
-│   ├── Connection.h                unique_ptr 成员 + int fd 构造
-│   ├── Acceptor.h                  unique_ptr 成员 + void(int) 回调
+│   ├── TcpServer.h                 新增 stop()；成员声明顺序调整
+│   ├── Connection.h                同 Day 19
+│   ├── EventLoop.h                 同 Day 19
 │   ├── Poller/                     策略模式（同 Day 18）
-│   ├── Airi-Cpp-Server-Lib.h            伞形头文件（含 TcpServer.h）
 │   └── ...
 ├── common/
-│   ├── TcpServer.cpp               替代 Server.cpp（新增）
-│   ├── Connection.cpp              make_unique 创建 Socket/Channel
-│   ├── Acceptor.cpp                简化回调，只传 fd
+│   ├── TcpServer.cpp               stop() + shared_ptr guard 安全析构
+│   ├── Connection.cpp              同 Day 19
 │   └── Poller/                     同 Day 18
 └── test/                           ThreadPoolTest / StressTest
 ```

@@ -95,4 +95,5 @@ void Eventloop::doPendingFunctors() {
 }
 
 void Eventloop::updateChannel(Channel *ch) { poller_->updateChannel(ch); }
+void Eventloop::deleteChannel(Channel *ch) { poller_->deleteChannel(ch); }
 void Eventloop::setQuit() { quit_ = true; }

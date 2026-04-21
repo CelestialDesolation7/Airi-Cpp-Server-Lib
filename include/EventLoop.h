@@ -34,6 +34,7 @@ class Eventloop {
     void loop();
     void setQuit();
     void updateChannel(Channel *ch);
+    void deleteChannel(Channel *ch);
     void queueInLoop(std::function<void()> func);
     void wakeup();
 };
