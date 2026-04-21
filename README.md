@@ -1,16 +1,15 @@
-# Day 02：Echo 循环 + errif 错误检查
+# Day 03：IO 多路复用 + 非阻塞 IO
 
-TCP echo 服务器——可以接收客户端输入并原样返回。
+使用 epoll（Linux）/ kqueue（macOS）实现多客户端并发 echo 服务器。
 
 ## 文件结构
 
 ```
-day02/
+day03/
 ├── CMakeLists.txt
-├── server.cpp      ← Echo 服务器：accept → while(read/write)
-├── client.cpp      ← 交互客户端：while(scanf/write/read)
-├── util.h          ← errif() 声明
-├── util.cpp        ← errif() 实现
+├── server.cpp      ← 多路复用 echo 服务器（边缘触发 + 非阻塞）
+├── client.cpp      ← 交互客户端（fgets 安全输入）
+├── util.h / util.cpp
 └── README.md
 ```
 
@@ -27,8 +26,8 @@ cmake --build build
 # 终端 1：启动服务器
 ./build/server
 
-# 终端 2：启动客户端
+# 终端 2, 3, ...：分别启动客户端
 ./build/client
 ```
 
-在客户端终端输入文字后回车，服务器会回显相同内容。客户端 Ctrl+C 退出。
+可以同时开多个客户端终端，服务器支持并发处理。输入文字回车后服务器回显。

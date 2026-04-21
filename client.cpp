@@ -1,5 +1,6 @@
 #include "util.h"
 #include <arpa/inet.h>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -32,7 +33,18 @@ int main() {
   while (true) {
     char buf[1024];
     bzero(buf, sizeof(buf));
-    scanf("%s", buf);
+    if (fgets(buf, sizeof(buf), stdin) == NULL) {
+      // 读到EOF退出客户端
+      break;
+    }
+    size_t len = strlen(buf);
+    if (len > 0 && buf[len - 1] == '\n') {
+      buf[len - 1] = '\0';
+      len--;
+    }
+    if (len == 0)
+      continue;
+
     ssize_t write_bytes = write(sockfd, buf, sizeof(buf));
 
     if (write_bytes == -1) {
