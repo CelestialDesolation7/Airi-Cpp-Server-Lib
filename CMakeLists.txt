@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(day10 LANGUAGES CXX)
+project(day11 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,4 +29,12 @@ add_executable(client
 add_executable(ThreadPoolTest
     test/ThreadPoolTest.cpp
     common/ThreadPool.cpp
+)
+
+add_executable(StressTest
+    test/StressTest.cpp
+    common/Buffer.cpp
+    common/InetAddress.cpp
+    common/Socket.cpp
+    common/util.cpp
 )

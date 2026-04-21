@@ -12,23 +12,23 @@ class Eventloop;
 #endif
 
 #ifdef __APPLE__
-constexpr uint32_t POLLER_READ  = 1;
+constexpr uint32_t POLLER_READ = 1;
 constexpr uint32_t POLLER_WRITE = 4;
-constexpr uint32_t POLLER_ET    = 2;
-constexpr uint32_t POLLER_PRI   = 8;
+constexpr uint32_t POLLER_ET = 2;
+constexpr uint32_t POLLER_PRI = 8;
 #else
-constexpr uint32_t POLLER_READ  = EPOLLIN;
+constexpr uint32_t POLLER_READ = EPOLLIN;
 constexpr uint32_t POLLER_WRITE = EPOLLOUT;
-constexpr uint32_t POLLER_ET    = EPOLLET;
-constexpr uint32_t POLLER_PRI   = EPOLLPRI;
+constexpr uint32_t POLLER_ET = EPOLLET;
+constexpr uint32_t POLLER_PRI = EPOLLPRI;
 #endif
 
 class Channel {
   private:
     Eventloop *loop;
     int fd;
-    uint32_t events;
-    uint32_t revents;
+    uint32_t events;  // 希望监听的事件
+    uint32_t revents; // 目前正在发生的事件
     bool inEpoll;
     std::function<void()> readCallback;
     std::function<void()> writeCallback;

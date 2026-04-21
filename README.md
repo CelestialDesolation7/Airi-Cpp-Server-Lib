@@ -1,24 +1,24 @@
-# Day 10 — ThreadPool 线程池
+# Day 11 — StressTest 压力测试
 
 ## 项目状态
 
-在 Day 09（Buffer 缓冲区）基础上，引入 **ThreadPool** 线程池：
+在 Day 10（ThreadPool 线程池）基础上，新增 **StressTest** 多线程压力测试客户端：
 
-- `ThreadPool` 管理工作线程 + 任务队列，支持任意可调用对象提交
-- `Connection` 新增 `onMessageCallback`，业务逻辑不再硬编码
-- `Server` 在 onMessageCallback 中将 Echo 任务提交到 ThreadPool 异步执行
+- `StressTest` 启动 N 个客户端线程，各发 M 条消息，校验 Echo 正确性
+- `Server` / `Connection` / `Channel` / `Epoll` 沿用 Day 10 接口，无新增方法
+- 业务逻辑仍通过 ThreadPool 异步执行
 
 ## 文件结构
 
 ```
-day10/
+day11/
 ├── CMakeLists.txt
 ├── server.cpp
 ├── client.cpp
 ├── include/
-│   ├── ThreadPool.h    ← 新增
-│   ├── Connection.h    ← 修改：新增 onMessageCallback + readBuffer/outBuffer
-│   ├── Server.h        ← 修改：新增 ThreadPool* 成员
+│   ├── ThreadPool.h
+│   ├── Connection.h
+│   ├── Server.h
 │   ├── Buffer.h
 │   ├── Channel.h
 │   ├── Acceptor.h
@@ -28,9 +28,9 @@ day10/
 │   ├── InetAddress.h
 │   └── util.h
 ├── common/
-│   ├── ThreadPool.cpp  ← 新增
-│   ├── Connection.cpp  ← 修改
-│   ├── Server.cpp      ← 修改
+│   ├── ThreadPool.cpp
+│   ├── Connection.cpp
+│   ├── Server.cpp
 │   ├── Buffer.cpp
 │   ├── Channel.cpp
 │   ├── Acceptor.cpp
@@ -40,7 +40,8 @@ day10/
 │   ├── InetAddress.cpp
 │   └── util.cpp
 └── test/
-    └── ThreadPoolTest.cpp  ← 新增
+    ├── ThreadPoolTest.cpp
+    └── StressTest.cpp    ← 新增
 ```
 
 ## 编译与运行
@@ -49,18 +50,19 @@ day10/
 cmake -S . -B build
 cmake --build build
 
-./build/server          # 终端 1
-./build/client          # 终端 2
-./build/ThreadPoolTest  # 线程池单元测试
+# 终端 1：启动服务器
+./build/server
+
+# 终端 2：运行压力测试（10 线程，每线程 100 条消息）
+./build/StressTest 10 100
+
+# 终端 3：运行客户端（手动测试）
+./build/client
 ```
 
-## 改进
+## 与 Day 10 的区别
 
-- 业务逻辑解耦：Connection 通过 onMessageCallback 回调，不再硬编码 Echo
-- 异步处理：耗时任务提交到 ThreadPool，不阻塞主 IO 线程
-- 线程池模板：支持任意函数签名 + std::future 获取返回值
-
-## 已知问题
-
-- Buffer 非线程安全：主线程 handleRead 写 inputBuffer，工作线程读 inputBuffer 存在竞争
-- 单 Reactor：所有 IO 仍在主线程，ThreadPool 仅处理业务计算
+| 变更 | 说明 |
+|------|------|
+| 新增 `test/StressTest.cpp` | 多线程压力测试，验证 Echo 服务正确性 |
+| 其余文件无变化 | Server/Connection/Channel/Epoll/Buffer 完全沿用 Day 10 |

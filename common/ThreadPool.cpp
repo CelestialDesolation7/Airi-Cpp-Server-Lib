@@ -42,7 +42,8 @@ ThreadPool::~ThreadPool() {
     }
     // 所有线程都被唤醒，从 wait 向下执行
     condition.notify_all();
-    for (std::thread &worker : workers)
-        worker.join();
-    // 阻塞直到每个线程报告执行完毕
+    for (std::thread &worker : workers) {
+        if (worker.joinable())
+            worker.join();
+    } // 阻塞直到每个线程报告执行完毕
 }

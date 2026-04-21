@@ -10,17 +10,17 @@
 #endif
 
 class Epoll {
-private:
-  int epfd;
+  private:
+    int epfd;
 #ifdef __APPLE__
-  struct kevent *events;
+    struct kevent *events;
 #else
-  struct epoll_event *events;
+    struct epoll_event *events;
 #endif
 
-public:
-  Epoll();
-  ~Epoll();
-  void updateChannel(Channel *channel);
-  std::vector<Channel *> poll(int timeout = -1);
+  public:
+    Epoll();
+    ~Epoll();
+    void updateChannel(Channel *channel);
+    std::vector<Channel *> poll(int timeout = -1);
 };

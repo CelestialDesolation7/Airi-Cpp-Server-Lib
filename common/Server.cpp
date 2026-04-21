@@ -1,5 +1,6 @@
 #include "Server.h"
 #include "Acceptor.h"
+#include "Buffer.h"
 #include "Connection.h"
 #include "InetAddress.h"
 #include "Socket.h"
@@ -43,18 +44,18 @@ void Server::newConnection(Socket *client_sock, InetAddress *client_addr) {
     // 定义一个 lambda 表达式，捕获 this （Server类指针）拿到ThreadPool
     // 定义 Server socket 的业务逻辑：
     // 把业务函数写在这里，作为一个Task加入线程池
-    std::function<void(Connection *)> msgCb = [this](Connection *c) {
+    std::function<void(Connection *)> msgCb = [this](Connection *conn) {
         // 这里的 lambda 是为了捕获 this (Server) 拿到 threadPool
         // 把具体的业务 (Echo) 作为一个 Task 添加到线程池
         // 注意：这里有严重的线程不安全！c->readBuffer 在主线程写，子线程读
         // 后面会修
 
-        threadPool->add([c]() {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            std::string msg = c->readBuffer()->retrieveAllAsString();
+        threadPool->add([conn]() {
+            // std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::string msg = conn->readBuffer()->retrieveAllAsString();
             std::cout << "Thread " << std::this_thread::get_id() << " recieve: " << msg
                       << std::endl;
-            c->send(msg);
+            conn->send(msg);
         });
     };
     conn->setOnMessageCallback(msgCb);
