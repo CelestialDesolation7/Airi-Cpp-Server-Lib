@@ -1,44 +1,49 @@
-# Day 23 — 跨平台定时器（TimerQueue）
+# Day 24 — 异步日志系统（AsyncLogging）
 
-在 EventLoop 中集成定时器系统，支持一次性（`runAfter`）与重复（`runEvery`）定时任务。采用 poll 超时驱动方案，无需 Linux 专有的 `timerfd_create`，Linux/macOS 通用。
+构建生产级异步日志框架：同步前端（Logger + LogStream）+ 异步后端（AsyncLogging 双缓冲区）+ 文件写入器（LogFile 自动滚动）。
 
 ## 新增模块
 
 | 文件 | 说明 |
 |------|------|
-| `include/timer/TimeStamp.h` | 微秒精度时间戳（header-only） |
-| `include/timer/Timer.h` | 单个定时任务：到期时刻 + 回调 + 重复间隔 |
-| `include/timer/TimerQueue.h` | 定时器有序队列（`std::set`） |
-| `common/timer/TimerQueue.cpp` | 插入、超时计算、过期处理 |
-| `test/TimerTest.cpp` | 定时器功能测试 |
+| `include/log/LogStream.h` | FixedBuffer + LogStream 流式格式化 |
+| `common/log/LogStream.cpp` | 各类型 operator<< 实现 |
+| `include/log/Logger.h` | 同步日志前端 + LOG_* 宏 |
+| `common/log/Logger.cpp` | 时间戳 + 线程编号 + 级别组装 |
+| `include/log/LogFile.h` | 日志文件写入器（自动滚动） |
+| `common/log/LogFile.cpp` | fopen/fwrite + rollFile |
+| `include/log/AsyncLogging.h` | 异步后端（双缓冲 + 后端写线程） |
+| `common/log/AsyncLogging.cpp` | 前端 append + 后端 threadFunc |
+| `include/Latch.h` | CountdownLatch 启动同步 |
+| `test/LogTest.cpp` | 日志系统测试 |
 
 ## 构建 & 运行
 
 ```bash
-cd HISTORY/day23
+cd HISTORY/day24
 cmake -S . -B build && cmake --build build -j4
 
-# 运行定时器测试
-./build/TimerTest
+# 运行日志测试
+./build/LogTest
 
 # 运行 echo 服务器
 ./build/server
-# 另一终端
-./build/client
 ```
 
 ## 可执行文件
 
 | 名称 | 说明 |
 |------|------|
-| `server` | Echo 服务器（带定时器） |
+| `server` | Echo 服务器（带定时器 + 日志） |
 | `client` | TCP 客户端 |
-| `TimerTest` | 定时器测试（一次性 + 重复 + 跨线程） |
+| `LogTest` | 日志系统测试（同步 + 异步 + 多线程） |
+| `TimerTest` | 定时器测试 |
 | `ThreadPoolTest` | 线程池测试 |
 | `StressTest` | 压力测试客户端 |
 
 ## 核心设计
 
-- `TimerQueue` 使用 `std::set<{TimeStamp, Timer*}>` 按到期时刻排序
-- `nextTimeoutMs()` 返回值直接传给 `poll()`/`kevent()` 的 timeout 参数
-- 所有定时器操作通过 `runInLoop` 投递，TimerQueue 无需加锁
+- **零堆分配前端**：FixedBuffer 栈分配，LOG_INFO 一次调用 ~200ns
+- **双缓冲交换**：前端 append 持锁仅 memcpy，后端无锁批量 fwrite
+- **LOG_DEBUG 零开销**：级别不足时 Logger 不构造，用户表达式不求值
+- **自动滚动**：文件超过 rollSizeBytes 后创建新文件（basename.YYYYMMDD_HHMMSS.log）

@@ -4,10 +4,10 @@
 #include "EventLoop.h"
 #include "EventLoopThreadPool.h"
 #include "Exception.h"
+#include "log/Logger.h"
 
 #include <algorithm>
 #include <functional>
-#include <iostream>
 #include <thread>
 
 TcpServer::TcpServer() {
@@ -22,7 +22,7 @@ TcpServer::TcpServer() {
     threadPool_ = std::make_unique<EventLoopThreadPool>(mainReactor_.get());
     threadPool_->setThreadNums(threadNum);
 
-    std::cout << "[TcpServer] Main Reactor + " << threadNum << " Sub Reactors ready." << std::endl;
+    LOG_INFO << "[TcpServer] Main Reactor + " << threadNum << " Sub Reactors ready.";
 }
 
 void TcpServer::Start() {
@@ -59,7 +59,7 @@ void TcpServer::newConnection(int fd) {
     // 此时 connections_[fd] 已插入 map，回调均已就绪
     subLoop->queueInLoop([rawConn]() { rawConn->enableInLoop(); });
 
-    std::cout << "[TcpServer] new connection fd=" << fd << std::endl;
+    LOG_INFO << "[TcpServer] new connection fd=" << fd;
 }
 
 void TcpServer::deleteConnection(int fd) {
@@ -71,7 +71,7 @@ void TcpServer::deleteConnection(int fd) {
             Eventloop *ioLoop = it->second->getLoop();
             std::unique_ptr<Connection> conn = std::move(it->second);
             connections_.erase(it);
-            std::cout << "[TcpServer] connection fd=" << fd << " deleted." << std::endl;
+            LOG_INFO << "[TcpServer] connection fd=" << fd << " deleted.";
 
             // 将 Connection 析构投递到其归属 sub-reactor 线程执行：
             // 保证 Connection::~Connection()（调用 loop_->deleteChannel）

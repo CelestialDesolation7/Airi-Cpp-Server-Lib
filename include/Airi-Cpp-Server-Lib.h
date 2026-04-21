@@ -7,3 +7,5 @@
 #include "SignalHandler.h"
 #include "Socket.h"
 #include "TcpServer.h"
+#include "log/AsyncLogging.h"
+#include "log/Logger.h"

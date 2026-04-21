@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(day23 LANGUAGES CXX)
+project(day24 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +13,13 @@ if(APPLE)
 else()
     list(APPEND POLLER_SRCS common/Poller/epoll/EpollPoller.cpp)
 endif()
+
+set(LOG_SRC
+    common/log/AsyncLogging.cpp
+    common/log/LogFile.cpp
+    common/log/LogStream.cpp
+    common/log/Logger.cpp
+)
 
 set(COMMON_SRC
     common/Acceptor.cpp
@@ -28,6 +35,7 @@ set(COMMON_SRC
     common/ThreadPool.cpp
     common/timer/TimerQueue.cpp
     common/util.cpp
+    ${LOG_SRC}
     ${POLLER_SRCS}
 )
 
@@ -38,6 +46,9 @@ add_executable(client client.cpp common/util.cpp)
 
 add_executable(TimerTest test/TimerTest.cpp ${COMMON_SRC})
 target_link_libraries(TimerTest pthread)
+
+add_executable(LogTest test/LogTest.cpp ${COMMON_SRC})
+target_link_libraries(LogTest pthread)
 
 add_executable(ThreadPoolTest test/ThreadPoolTest.cpp common/ThreadPool.cpp)
 target_link_libraries(ThreadPoolTest pthread)

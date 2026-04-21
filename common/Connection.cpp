@@ -3,13 +3,13 @@
 #include "Channel.h"
 #include "EventLoop.h"
 #include "Socket.h"
+#include "log/Logger.h"
 
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <functional>
-#include <iostream>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -42,7 +42,7 @@ void Connection::doRead() {
             continue;
         } else if (n == 0) {
             state_ = State::kClosed;
-            std::cout << "[server] client fd " << sockfd << " disconnected." << std::endl;
+            LOG_INFO << "[server] client fd " << sockfd << " disconnected.";
             // 不在此处调用 close()，由 Business() 在所有回调完成后统一触发
             // 防止 close() → queueInLoop(删除) 后 Main Reactor 立刻析构 Connection
             // 而 Business() 中 onMessageCallback_(this) 尚未执行完毕，导致 use-after-free
@@ -53,8 +53,7 @@ void Connection::doRead() {
                 break;
             }
             state_ = State::kFailed;
-            std::cerr << "[server] read error on fd " << sockfd << ": " << strerror(savedErrno)
-                      << std::endl;
+            LOG_ERROR << "[server] read error on fd " << sockfd << ": " << strerror(savedErrno);
             // 同上，由 Business() 统一触发删除
             break;
         }
