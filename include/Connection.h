@@ -5,6 +5,7 @@
 #include "Socket.h"
 #include "timer/TimeStamp.h"
 #include <any>
+#include <cstddef>
 #include <functional>
 #include <memory>
 
@@ -21,9 +22,36 @@ class Connection {
         kFailed,
     };
 
+    // ── 回压配置（Phase 1-2）──────────────────────────────────────────────
+    // low < high < hardLimit
+    // - buffered > high      -> 暂停读事件，优先排空写缓冲
+    // - buffered <= low      -> 恢复读事件
+    // - buffered > hardLimit -> 触发保护性断连，防止内存失控
+    struct BackpressureConfig {
+      size_t lowWatermarkBytes{4 * 1024 * 1024};
+      size_t highWatermarkBytes{16 * 1024 * 1024};
+      size_t hardLimitBytes{64 * 1024 * 1024};
+    };
+
+    struct BackpressureDecision {
+      bool shouldPauseRead{false};
+      bool shouldResumeRead{false};
+      bool shouldCloseConnection{false};
+    };
+
     // 构造参数改为 int fd，Socket 在内部创建
     Connection(int fd, Eventloop *loop);
     ~Connection();
+
+    // 回压策略配置：传入非法配置会被忽略并打印告警。
+    void setBackpressureConfig(const BackpressureConfig &cfg);
+    const BackpressureConfig &backpressureConfig() const { return backpressureConfig_; }
+    bool isReadPausedByBackpressure() const { return readPausedByBackpressure_; }
+
+    static bool isValidBackpressureConfig(const BackpressureConfig &cfg);
+    static BackpressureDecision evaluateBackpressure(size_t bufferedBytes,
+                             bool readPaused,
+                             const BackpressureConfig &cfg);
 
     void send(const std::string &msg);
     // 移动重载：当调用方持有临时字符串（如 resp.serialize() 的返回值）时，
@@ -81,6 +109,9 @@ class Connection {
     std::shared_ptr<bool> alive_{std::make_shared<bool>(true)};
     TimeStamp lastActive_;
 
+    BackpressureConfig backpressureConfig_{};
+    bool readPausedByBackpressure_{false};
+
     std::function<void(int)> deleteConnectionCallback_;
     // 业务处理回调，当 Buffer 有数据时被调用
     std::function<void(Connection *)> onConnectCallback_;
@@ -89,4 +120,7 @@ class Connection {
     // 原本调用 callback 的逻辑从这里分离，现在这两个函数只管IO
     void doRead();
     void doWrite();
+
+    void applyBackpressureAfterAppend();
+    void tryResumeReadAfterDrain();
 };

@@ -60,3 +60,44 @@ std::string HttpResponse::serialize() const {
 
     return result;
 }
+
+// ── 实用工具 ───────────────────────────────────────────────────────────────
+
+void HttpResponse::setContentTypeByFilename(const std::string &filename) {
+    size_t dot = filename.rfind('.');
+    if (dot == std::string::npos) {
+        setContentType("application/octet-stream");
+        return;
+    }
+    std::string ext = filename.substr(dot + 1);
+    if (ext == "html" || ext == "htm") {
+        setContentType("text/html; charset=utf-8");
+    } else if (ext == "css") {
+        setContentType("text/css");
+    } else if (ext == "js") {
+        setContentType("application/javascript");
+    } else if (ext == "json") {
+        setContentType("application/json");
+    } else if (ext == "png") {
+        setContentType("image/png");
+    } else if (ext == "jpg" || ext == "jpeg") {
+        setContentType("image/jpeg");
+    } else if (ext == "gif") {
+        setContentType("image/gif");
+    } else if (ext == "svg") {
+        setContentType("image/svg+xml");
+    } else if (ext == "txt") {
+        setContentType("text/plain; charset=utf-8");
+    } else if (ext == "pdf") {
+        setContentType("application/pdf");
+    } else {
+        setContentType("application/octet-stream");
+    }
+}
+
+void HttpResponse::setRedirect(const std::string &location) {
+    setStatus(StatusCode::k302Found, "Found");
+    addHeader("Location", location);
+    setContentType("text/html; charset=utf-8");
+    setBody("<html><body>Redirecting to <a href=\"" + location + "\">" + location + "</a></body></html>");
+}

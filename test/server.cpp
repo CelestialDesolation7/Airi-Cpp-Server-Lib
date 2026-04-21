@@ -1,15 +1,68 @@
-#include "include/Connection.h"
-#include "include/EventLoop.h"
-#include "include/EventLoopThread.h"
-#include "include/SignalHandler.h"
-#include "include/TcpServer.h"
-#include "include/timer/TimeStamp.h"
+#include <Connection.h>
+#include <EventLoop.h>
+#include <EventLoopThread.h>
+#include <SignalHandler.h>
+#include <TcpServer.h>
 #include <atomic>
+#include <cerrno>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <thread>
+#include <timer/TimeStamp.h>
+
+
+namespace {
+
+std::string envOr(const char *key, const std::string &fallback) {
+    const char *v = std::getenv(key);
+    if (!v || v[0] == '\0')
+        return fallback;
+    return v;
+}
+
+int envIntOr(const char *key, int fallback) {
+    const char *v = std::getenv(key);
+    if (!v || v[0] == '\0')
+        return fallback;
+    errno = 0;
+    char *end = nullptr;
+    long parsed = std::strtol(v, &end, 10);
+    if (errno != 0 || end == v || *end != '\0')
+        return fallback;
+    if (parsed > std::numeric_limits<int>::max() || parsed < std::numeric_limits<int>::min())
+        return fallback;
+    return static_cast<int>(parsed);
+}
+
+size_t envSizeOr(const char *key, size_t fallback) {
+    const int parsed = envIntOr(key, static_cast<int>(fallback));
+    if (parsed <= 0)
+        return fallback;
+    return static_cast<size_t>(parsed);
+}
+
+uint16_t envPortOr(const char *key, uint16_t fallback) {
+    int p = envIntOr(key, static_cast<int>(fallback));
+    if (p <= 0 || p > 65535)
+        return fallback;
+    return static_cast<uint16_t>(p);
+}
+
+} // namespace
 
 int main() {
-    TcpServer server;
+    TcpServer::Options options;
+    options.listenIp = envOr("MYCPPSERVER_BIND_IP", "127.0.0.1");
+    options.listenPort = envPortOr("MYCPPSERVER_BIND_PORT", 8888);
+    options.ioThreads = envIntOr("MYCPPSERVER_IO_THREADS", 0);
+    options.maxConnections = envSizeOr("MYCPPSERVER_MAX_CONNECTIONS", 10000);
+
+    std::cout << "[server] config: listen=" << options.listenIp << ":" << options.listenPort
+              << " ioThreads=" << options.ioThreads << " maxConnections=" << options.maxConnections
+              << std::endl;
+
+    TcpServer server(options);
 
     Signal::signal(SIGINT, [&] {
         // 用 atomic_flag 保证信号处理函数幂等：
@@ -24,8 +77,8 @@ int main() {
     });
 
     server.newConnect([](Connection *conn) {
-        std::cout << "[server] New client connected, fd=" << conn->getSocket()->getFd()
-                  << " at " << TimeStamp::now().toString() << std::endl;
+        std::cout << "[server] New client connected, fd=" << conn->getSocket()->getFd() << " at "
+                  << TimeStamp::now().toString() << std::endl;
 
         // Phase 2 演示：为每条新连接在其归属的 sub-reactor 上添加一个空闲超时定时器。
         // 若 60 秒内连接没有被关闭（业务层未调用 conn->close()），则主动断开。

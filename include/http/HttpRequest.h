@@ -41,6 +41,16 @@ class HttpRequest {
 
     void reset(); // 清空所有字段，供 keep-alive 复用
 
+    // ── 实用解析工具 ───────────────────────────────────────────────────────────
+    static std::string urlDecode(const std::string &str);
+    
+    struct MultipartFile {
+        std::string filename;
+        std::string data;
+    };
+    // 解析 multipart/form-data（单文件简单实现）
+    bool parseMultipart(MultipartFile &out) const;
+
   private:
     Method method_{Method::kInvalid};
     Version version_{Version::kUnknown};

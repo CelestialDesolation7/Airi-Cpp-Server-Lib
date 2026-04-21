@@ -3,6 +3,7 @@
 #include "TcpServer.h"
 #include "http/HttpRequest.h"
 #include "http/HttpResponse.h"
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -27,14 +28,27 @@ class HttpServer {
   public:
     DISALLOW_COPY_AND_MOVE(HttpServer)
 
+    // ── Day 28：HttpServer 配置参数集（Phase 3）──────────────────────────
+    // 与 TcpServer::Options 同样的设计动机：把分散的开关集中到一个结构
+    // 体里，方便测试用例 / app_example 一行注入完整配置。
+    struct Options {
+        TcpServer::Options tcp;      // 透传给底层 TcpServer 的网络参数
+        bool autoClose{false};       // 是否启用空闲超时自动关闭
+        double idleTimeoutSec{60.0}; // autoClose=true 时的超时阈值
+    };
+
     // callback 类型：用户处理函数签名，收到一个完整 HttpRequest，填写 HttpResponse
     using HttpCallback = std::function<void(const HttpRequest &, HttpResponse *)>;
 
-    explicit HttpServer();
+    HttpServer();
+    explicit HttpServer(const Options &options);
     ~HttpServer() = default;
 
     // 设置业务回调（未设置时返回 404）
     void setHttpCallback(HttpCallback cb) { httpCallback_ = std::move(cb); }
+
+    // 最大连接数保护（透传到 TcpServer）
+    void setMaxConnections(size_t maxConnections) { server_->setMaxConnections(maxConnections); }
 
     // ── Day21：空闲连接自动关闭 ──────────────────────────────────────────────
     // 启用后，若某连接在 timeoutSec 秒内没有任何数据交互，服务器主动关闭它。
@@ -53,7 +67,8 @@ class HttpServer {
   private:
     void onNewConnection(Connection *conn);
     void onMessage(Connection *conn);
-    void onRequest(Connection *conn, const HttpRequest &req);
+    // 返回 true 表示连接可继续处理后续请求；false 表示已进入关闭流程。
+    bool onRequest(Connection *conn, const HttpRequest &req);
 
     // 默认响应：404 Not Found
     void defaultCallback(const HttpRequest &req, HttpResponse *resp);

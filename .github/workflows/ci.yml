@@ -1,0 +1,35 @@
+name: CI
+
+# Day 28 引入：每次 push / PR 在 Linux + macOS 上完成构建与全部 CTest 用例。
+# 后续 day31 起会基于此基础矩阵扩展 ASan / TSan / UBSan / Coverage / clang-tidy
+# / 基准回归等任务，这里保持最小可运行集合。
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        run: cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Run CTest
+        working-directory: build
+        run: ctest --output-on-failure -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)

@@ -1,5 +1,6 @@
 #pragma once
 #include "Macros.h"
+#include <cstdint>
 #include <functional>
 #include <memory>
 
@@ -18,7 +19,8 @@ class Acceptor {
     std::function<void(int)> newConnectionCallback_; // 只传 fd
 
   public:
-    explicit Acceptor(Eventloop *_loop);
+    explicit Acceptor(Eventloop *_loop, const char *ip = "127.0.0.1",
+                      uint16_t port = 8888);
     ~Acceptor(); // unique_ptr 自动析构
 
     void acceptConnection(); // 以前 Server::handleReadEvent 的创建新连接的逻辑

@@ -21,10 +21,8 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <numeric>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -33,20 +31,20 @@
 
 // ── 配置参数 ──────────────────────────────────────────────────────────────────
 struct Config {
-    std::string host    = "127.0.0.1";
-    int         port    = 8888;
-    std::string url     = "/";
-    int         threads = 4;
-    int         durationSec = 10;
+    std::string host = "127.0.0.1";
+    int port = 8888;
+    std::string url = "/";
+    int threads = 4;
+    int durationSec = 10;
 };
 
 // ── 每线程统计 ────────────────────────────────────────────────────────────────
 struct Stats {
-    long long requests  = 0;
-    long long errors    = 0;
-    long long latencyUs = 0;  // 累积延迟（微秒）
-    long long minUs     = std::numeric_limits<long long>::max();
-    long long maxUs     = 0;
+    long long requests = 0;
+    long long errors = 0;
+    long long latencyUs = 0; // 累积延迟（微秒）
+    long long minUs = std::numeric_limits<long long>::max();
+    long long maxUs = 0;
 };
 
 static std::atomic<bool> g_running{false};
@@ -54,7 +52,8 @@ static std::atomic<bool> g_running{false};
 // ── 建立 TCP 连接 ─────────────────────────────────────────────────────────────
 static int connectToServer(const std::string &host, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (fd < 0)
+        return -1;
 
     // TCP_NODELAY 减少 Nagle 算法延迟，提高短包测试的准确性
     int flag = 1;
@@ -73,13 +72,13 @@ static int connectToServer(const std::string &host, int port) {
 }
 
 // ── 发送一个 HTTP GET 请求并接收响应头（keep-alive）────────────────────────────
-static bool doRequest(int fd, const std::string &request,
-                      char *recvBuf, int bufLen) {
+static bool doRequest(int fd, const std::string &request, char *recvBuf, int bufLen) {
     // 发送
     ssize_t nsent = 0;
     while (nsent < static_cast<ssize_t>(request.size())) {
         ssize_t n = write(fd, request.data() + nsent, request.size() - nsent);
-        if (n <= 0) return false;
+        if (n <= 0)
+            return false;
         nsent += n;
     }
     // 接收响应：读到 \r\n\r\n（headers 结束）即停止（简化处理，不解析 Content-Length）
@@ -87,7 +86,8 @@ static bool doRequest(int fd, const std::string &request,
     bool foundEnd = false;
     while (total < bufLen - 1) {
         ssize_t n = read(fd, recvBuf + total, bufLen - total - 1);
-        if (n <= 0) return false;
+        if (n <= 0)
+            return false;
         total += static_cast<int>(n);
         recvBuf[total] = '\0';
         if (strstr(recvBuf, "\r\n\r\n") != nullptr) {
@@ -101,11 +101,13 @@ static bool doRequest(int fd, const std::string &request,
 // ── 单个测试线程 ──────────────────────────────────────────────────────────────
 static void workerThread(const Config &cfg, Stats &stats) {
     // 构造一次性 HTTP 请求字符串（keep-alive）
-    std::string req =
-        "GET " + cfg.url + " HTTP/1.1\r\n"
-        "Host: " + cfg.host + "\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n";
+    std::string req = "GET " + cfg.url +
+                      " HTTP/1.1\r\n"
+                      "Host: " +
+                      cfg.host +
+                      "\r\n"
+                      "Connection: keep-alive\r\n"
+                      "\r\n";
 
     char recvBuf[4096];
     int fd = -1;
@@ -139,11 +141,14 @@ static void workerThread(const Config &cfg, Stats &stats) {
         long long us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         ++stats.requests;
         stats.latencyUs += us;
-        if (us < stats.minUs) stats.minUs = us;
-        if (us > stats.maxUs) stats.maxUs = us;
+        if (us < stats.minUs)
+            stats.minUs = us;
+        if (us > stats.maxUs)
+            stats.maxUs = us;
     }
 
-    if (fd >= 0) close(fd);
+    if (fd >= 0)
+        close(fd);
 }
 
 // ── 打印进度条 ────────────────────────────────────────────────────────────────
@@ -151,18 +156,24 @@ static void printProgress(int elapsed, int total) {
     int width = 30;
     int filled = width * elapsed / total;
     std::cout << "\r  [";
-    for (int i = 0; i < width; ++i) std::cout << (i < filled ? '#' : '-');
+    for (int i = 0; i < width; ++i)
+        std::cout << (i < filled ? '#' : '-');
     std::cout << "] " << std::setw(3) << elapsed << "/" << total << "s" << std::flush;
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 int main(int argc, char *argv[]) {
     Config cfg;
-    if (argc > 1) cfg.host        = argv[1];
-    if (argc > 2) cfg.port        = std::stoi(argv[2]);
-    if (argc > 3) cfg.url         = argv[3];
-    if (argc > 4) cfg.threads     = std::stoi(argv[4]);
-    if (argc > 5) cfg.durationSec = std::stoi(argv[5]);
+    if (argc > 1)
+        cfg.host = argv[1];
+    if (argc > 2)
+        cfg.port = std::stoi(argv[2]);
+    if (argc > 3)
+        cfg.url = argv[3];
+    if (argc > 4)
+        cfg.threads = std::stoi(argv[4]);
+    if (argc > 5)
+        cfg.durationSec = std::stoi(argv[5]);
 
     std::cout << "╔══════════════════════════════════════╗\n"
               << "║   Airi-Cpp-Server-Lib — HTTP Benchmark    ║\n"
@@ -201,40 +212,44 @@ int main(int argc, char *argv[]) {
     std::cout << "\n\n";
 
     g_running.store(false, std::memory_order_relaxed);
-    for (auto &t : workers) t.join();
+    for (auto &t : workers)
+        t.join();
 
-    auto elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - startTime).count();
+    auto elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
 
     // ── 汇总统计 ──────────────────────────────────────────────────────────────
     long long totalReqs = 0, totalErrors = 0, totalUs = 0;
     long long minUs = std::numeric_limits<long long>::max(), maxUs = 0;
     for (const auto &s : statsVec) {
-        totalReqs   += s.requests;
+        totalReqs += s.requests;
         totalErrors += s.errors;
-        totalUs     += s.latencyUs;
-        if (s.minUs < minUs) minUs = s.minUs;
-        if (s.maxUs > maxUs) maxUs = s.maxUs;
+        totalUs += s.latencyUs;
+        if (s.minUs < minUs)
+            minUs = s.minUs;
+        if (s.maxUs > maxUs)
+            maxUs = s.maxUs;
     }
-    if (minUs == std::numeric_limits<long long>::max()) minUs = 0;
+    if (minUs == std::numeric_limits<long long>::max())
+        minUs = 0;
 
-    double qps    = totalReqs / elapsed;
-    double avgUs  = totalReqs > 0 ? static_cast<double>(totalUs) / totalReqs : 0;
-    double mbSec  = qps * 200 / (1024.0 * 1024.0); // 估算吞吐（假设平均响应 200B）
+    double qps = totalReqs / elapsed;
+    double avgUs = totalReqs > 0 ? static_cast<double>(totalUs) / totalReqs : 0;
+    double mbSec = qps * 200 / (1024.0 * 1024.0); // 估算吞吐（假设平均响应 200B）
 
     std::cout << "  ┌─────────────────────────────────────┐\n"
               << "  │           Benchmark Results          │\n"
               << "  ├─────────────────────────────────────┤\n"
-              << "  │ Total requests : " << std::setw(16) << totalReqs  << "  │\n"
+              << "  │ Total requests : " << std::setw(16) << totalReqs << "  │\n"
               << "  │ Total errors   : " << std::setw(16) << totalErrors << "  │\n"
-              << "  │ Duration       : " << std::setw(13) << std::fixed
-                                         << std::setprecision(2) << elapsed << " s" << "  │\n"
-              << "  │ QPS            : " << std::setw(12)
-                                         << std::setprecision(0) << qps << " req/s" << "  │\n"
-              << "  │ Throughput     : " << std::setw(12)
-                                         << std::setprecision(2) << mbSec << " MB/s" << "  │\n"
-              << "  │ Latency avg    : " << std::setw(12)
-                                         << std::setprecision(1) << avgUs << " µs" << "  │\n"
+              << "  │ Duration       : " << std::setw(13) << std::fixed << std::setprecision(2)
+              << elapsed << " s" << "  │\n"
+              << "  │ QPS            : " << std::setw(12) << std::setprecision(0) << qps << " req/s"
+              << "  │\n"
+              << "  │ Throughput     : " << std::setw(12) << std::setprecision(2) << mbSec
+              << " MB/s" << "  │\n"
+              << "  │ Latency avg    : " << std::setw(12) << std::setprecision(1) << avgUs << " µs"
+              << "  │\n"
               << "  │ Latency min    : " << std::setw(12) << minUs << " µs" << "  │\n"
               << "  │ Latency max    : " << std::setw(12) << maxUs << " µs" << "  │\n"
               << "  └─────────────────────────────────────┘\n\n";

@@ -1,12 +1,16 @@
 #include "EventLoop.h"
 #include "Channel.h"
 #include "Poller/Poller.h"
+#include "log/Logger.h"
 #include "timer/TimerQueue.h"
 #include "timer/TimeStamp.h"
-#include "util.h"
+
+#include <cerrno>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unistd.h>
 #include <vector>
 
@@ -25,15 +29,34 @@ Eventloop::Eventloop() : poller_(nullptr), quit_(false), tid_(std::this_thread::
 
 #ifdef __linux__
     evtfd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    ErrIf(evtfd_ == -1, "eventfd create error.");
+    if (evtfd_ == -1) {
+        LOG_ERROR << "[Eventloop] eventfd 创建失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+        throw std::runtime_error("eventfd create failed");
+    }
     evtChannel_ = std::make_unique<Channel>(this, evtfd_);
 #elif defined(__APPLE__)
     int pipeFds[2];
-    ErrIf(pipe(pipeFds) == -1, "pipe create error.");
+    if (pipe(pipeFds) == -1) {
+        LOG_ERROR << "[Eventloop] pipe 创建失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+        throw std::runtime_error("pipe create failed");
+    }
     wakeupReadFd_ = pipeFds[0];
     wakeupWriteFd_ = pipeFds[1];
-    fcntl(wakeupReadFd_, F_SETFL, fcntl(wakeupReadFd_, F_GETFL) | O_NONBLOCK);
-    fcntl(wakeupWriteFd_, F_SETFL, fcntl(wakeupWriteFd_, F_GETFL) | O_NONBLOCK);
+    int readFlags = fcntl(wakeupReadFd_, F_GETFL);
+    int writeFlags = fcntl(wakeupWriteFd_, F_GETFL);
+    if (readFlags == -1 || writeFlags == -1 ||
+        fcntl(wakeupReadFd_, F_SETFL, readFlags | O_NONBLOCK) == -1 ||
+        fcntl(wakeupWriteFd_, F_SETFL, writeFlags | O_NONBLOCK) == -1) {
+        LOG_ERROR << "[Eventloop] pipe 设置非阻塞失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+        close(wakeupReadFd_);
+        close(wakeupWriteFd_);
+        wakeupReadFd_ = -1;
+        wakeupWriteFd_ = -1;
+        throw std::runtime_error("pipe nonblocking setup failed");
+    }
     evtChannel_ = std::make_unique<Channel>(this, wakeupReadFd_);
 #endif
 
@@ -47,31 +70,83 @@ Eventloop::~Eventloop() {
     // poller_（unique_ptr）后析构——Channel 已注销后再销毁 poller，顺序安全
     // 文件描述符由平台 OS 对象管理，仍需手动关闭
 #ifdef __linux__
-    close(evtfd_);
+    if (evtfd_ != -1)
+        close(evtfd_);
 #elif defined(__APPLE__)
-    close(wakeupReadFd_);
-    close(wakeupWriteFd_);
+    if (wakeupReadFd_ != -1)
+        close(wakeupReadFd_);
+    if (wakeupWriteFd_ != -1)
+        close(wakeupWriteFd_);
 #endif
 }
 
 void Eventloop::handleWakeup() {
 #ifdef __linux__
+    if (evtfd_ == -1)
+        return;
     uint64_t val;
-    (void)read(evtfd_, &val, sizeof(val));
+    while (true) {
+        ssize_t n = read(evtfd_, &val, sizeof(val));
+        if (n == static_cast<ssize_t>(sizeof(val)))
+            return;
+        if (n == -1 && errno == EINTR)
+            continue;
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        LOG_WARN << "[Eventloop] 处理 wakeup 读事件失败，错误=" << strerror(errno)
+                 << " errno=" << errno;
+        return;
+    }
 #elif defined(__APPLE__)
+    if (wakeupReadFd_ == -1)
+        return;
     char buf[256];
-    while (read(wakeupReadFd_, buf, sizeof(buf)) > 0) {
+    while (true) {
+        ssize_t n = read(wakeupReadFd_, buf, sizeof(buf));
+        if (n > 0)
+            continue;
+        if (n == -1 && errno == EINTR)
+            continue;
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        return;
     }
 #endif
 }
 
 void Eventloop::wakeup() {
 #ifdef __linux__
+    if (evtfd_ == -1)
+        return;
     uint64_t one = 1;
-    (void)write(evtfd_, &one, sizeof(one));
+    while (true) {
+        ssize_t n = write(evtfd_, &one, sizeof(one));
+        if (n == static_cast<ssize_t>(sizeof(one)))
+            return;
+        if (n == -1 && errno == EINTR)
+            continue;
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        LOG_WARN << "[Eventloop] wakeup 写入失败，错误=" << strerror(errno)
+                 << " errno=" << errno;
+        return;
+    }
 #elif defined(__APPLE__)
+    if (wakeupWriteFd_ == -1)
+        return;
     char buf = 'w';
-    (void)write(wakeupWriteFd_, &buf, 1);
+    while (true) {
+        ssize_t n = write(wakeupWriteFd_, &buf, 1);
+        if (n == 1)
+            return;
+        if (n == -1 && errno == EINTR)
+            continue;
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        LOG_WARN << "[Eventloop] wakeup 写入失败，错误=" << strerror(errno)
+                 << " errno=" << errno;
+        return;
+    }
 #endif
 }
 

@@ -3,18 +3,27 @@
 
 #include "Poller/KqueuePoller.h"
 #include "Channel.h"
-#include "util.h"
+#include "log/Logger.h"
+
 #include <cerrno>
+#include <cstring>
+#include <stdexcept>
 #include <sys/event.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
-#define MAX_EVENTS 1024
+namespace {
+constexpr int kInitialEvents = 1024;
+} // namespace
 
-KqueuePoller::KqueuePoller(Eventloop *loop) : Poller(loop), kqueueFd_(-1), events_(MAX_EVENTS) {
+KqueuePoller::KqueuePoller(Eventloop *loop) : Poller(loop), kqueueFd_(-1), events_(kInitialEvents) {
     kqueueFd_ = kqueue();
-    ErrIf(kqueueFd_ == -1, "[server] kqueue create error.");
+    if (kqueueFd_ == -1) {
+        LOG_ERROR << "[KqueuePoller] kqueue 创建失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+        throw std::runtime_error("kqueue create failed");
+    }
 }
 
 KqueuePoller::~KqueuePoller() {
@@ -49,8 +58,11 @@ void KqueuePoller::updateChannel(Channel *channel) {
         EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, channel);
     }
     if (n > 0) {
-        ErrIf(kevent(kqueueFd_, ev, n, nullptr, 0, nullptr) == -1,
-              "[server] kqueue updateChannel error");
+        if (kevent(kqueueFd_, ev, n, nullptr, 0, nullptr) == -1) {
+            LOG_ERROR << "[KqueuePoller] updateChannel 失败，fd=" << fd
+                      << " 错误=" << strerror(errno) << " errno=" << errno;
+            return;
+        }
     }
     channel->setInEpoll(listenEvents != 0);
 }
@@ -76,11 +88,17 @@ std::vector<Channel *> KqueuePoller::poll(int timeout) {
         ts.tv_nsec = static_cast<long>(timeout % 1000) * 1000000;
         pts = &ts;
     }
-    int nfds = kevent(kqueueFd_, nullptr, 0, events_.data(), MAX_EVENTS, pts);
+    int nfds = kevent(kqueueFd_, nullptr, 0, events_.data(), static_cast<int>(events_.size()), pts);
     if (nfds == -1) {
-        if (errno != EINTR)
-            ErrIf(true, "[server] kqueue wait error.");
+        if (errno != EINTR) {
+            LOG_ERROR << "[KqueuePoller] kevent wait 失败，错误=" << strerror(errno)
+                      << " errno=" << errno;
+        }
         return activeChannels;
+    }
+
+    if (nfds == static_cast<int>(events_.size())) {
+        events_.resize(events_.size() * 2);
     }
 
     // 合并同一 Channel 上的多个事件（kqueue 对同一 fd 可能分别返回

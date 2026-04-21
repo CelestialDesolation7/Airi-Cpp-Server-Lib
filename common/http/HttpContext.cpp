@@ -14,7 +14,10 @@ void HttpContext::reset() {
 
 // ── 有限状态机核心 ──────────────────────────────────────────────────────────
 // 以字符为单位驱动状态迁移。支持 TCP 粘包：多次调用 parse()，状态在调用间持续。
-bool HttpContext::parse(const char *data, int len) {
+bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
+    if (consumedBytes)
+        *consumedBytes = 0;
+
     if (state_ == State::kInvalid || state_ == State::kComplete)
         return state_ == State::kComplete;
 
@@ -236,5 +239,7 @@ bool HttpContext::parse(const char *data, int len) {
     }
 
 done:
+    if (consumedBytes)
+        *consumedBytes = static_cast<int>(p - data);
     return state_ != State::kInvalid;
 }

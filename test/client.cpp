@@ -1,4 +1,3 @@
-#include "util.h"
 #include <arpa/inet.h>
 #include <cstddef>
 #include <cstdio>
@@ -14,7 +13,10 @@
 int main() {
     // 初始化本机socket
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    ErrIf(sockfd == -1, "[客户端] socket创建失败");
+    if (sockfd == -1) {
+        perror("[客户端] socket创建失败");
+        return 1;
+    }
 
     // 初始化服务器地址
     struct sockaddr_in server_addr;
@@ -24,9 +26,12 @@ int main() {
     server_addr.sin_port = htons(8888);
     // 对应server那边的地址
 
-    ErrIf(connect(sockfd, reinterpret_cast<struct sockaddr *>(&server_addr), sizeof(server_addr)) ==
-              -1,
-          "[客户端] 与server建立连接时失败\n");
+    if (connect(sockfd, reinterpret_cast<struct sockaddr *>(&server_addr), sizeof(server_addr)) ==
+        -1) {
+        perror("[客户端] 与server建立连接时失败");
+        close(sockfd);
+        return 1;
+    }
 
     std::cout << "[客户端] 成功与server建立TCP连接\n";
 
@@ -64,8 +69,8 @@ int main() {
             std::cout << "[客户端] 服务器 socket 断开连接\n";
             break;
         } else if (read_bytes == -1) {
-            close(sockfd);
-            ErrIf(true, "[客户端] socket 读取失败");
+            perror("[客户端] socket 读取失败");
+            break;
         }
     }
 

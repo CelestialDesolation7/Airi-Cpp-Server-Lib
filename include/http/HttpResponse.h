@@ -26,6 +26,11 @@ class HttpResponse {
     // ── 响应头 ─────────────────────────────────────────────────────────────────
     void addHeader(const std::string &key, const std::string &value);
     void setContentType(const std::string &contentType); // 设置 Content-Type
+    void setContentTypeByFilename(const std::string &filename); // 根据文件扩展名自动推断 MIME 设置 Content-Type
+    
+    // 实用动作：设置 302 重定向
+    void setRedirect(const std::string &location);
+
     void setCloseConnection(bool close) { closeConnection_ = close; }
     bool closeConnection() const { return closeConnection_; }
 

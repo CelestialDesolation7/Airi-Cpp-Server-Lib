@@ -1,51 +1,67 @@
-# Day 27 — 调试与性能优化
+# Day 28 — 测试框架与 CI（Phase 3）
 
-针对 Day 26 HTTP 应用在压测中暴露的性能瓶颈进行系统优化：静态文件内存缓存、Connection::send 移动语义、HttpContext 解析热路径加速、Socket 错误诊断增强。
+将核心决策逻辑提取为纯策略函数，编写不依赖网络的单元测试；引入回压（backpressure）机制和连接上限保护；移除 util.cpp/util.h；新增外部库使用示例 `app_example/`。
 
-## 变更模块
+## 新增 / 变更模块
 
 | 文件 | 说明 |
 |------|------|
-| `http_server.cpp` | 启动时预加载静态文件到内存缓存 (`g_staticCache`)，消除请求热路径磁盘 I/O |
-| `include/Connection.h` | 新增 `send(std::string&&)` 移动重载 |
-| `common/Connection.cpp` | 实现 send 移动语义：直写路径零拷贝 |
-| `include/http/HttpContext.h` | 新增 `bodyLen_` 成员缓存 Content-Length |
-| `common/http/HttpContext.cpp` | Content-Length 仅查找一次并缓存，消除热路径哈希查找 |
-| `common/Socket.cpp` | 所有操作增加 `errno` + `strerror` 诊断日志 |
-| `common/Poller/kqueue/KqueuePoller.cpp` | kevent 错误日志增强 |
-| `test/StressTest.cpp` | 统计数据增加最大/最小延迟 |
+| `include/Connection.h` | `BackpressureConfig` / `BackpressureDecision` 结构体；`evaluateBackpressure()` 纯策略函数 |
+| `include/TcpServer.h` | `Options` 配置结构体；`shouldRejectNewConnection()` / `normalizeIoThreadCount()` 纯策略函数 |
+| `include/Socket.h` | 所有操作改为返回 `bool` |
+| `include/Poller/EpollPoller.h` | `shouldRetryWithMod/Add()` / `shouldIgnoreCtlError()` 策略函数 |
+| `include/http/HttpContext.h` | `parse()` 新增 `consumed` 出参，支持 HTTP pipeline |
+| `test/BackpressureDecisionTest.cpp` | 回压策略纯函数测试 |
+| `test/EpollPolicyTest.cpp` | epoll 自愈策略测试（macOS 自动跳过） |
+| `test/HttpContextTest.cpp` | HTTP 解析器测试：pipeline / 分段 body / 非法方法 |
+| `test/SocketPolicyTest.cpp` | Socket 返回值语义测试 |
+| `test/TcpServerPolicyTest.cpp` | 连接上限 / IO 线程归一化测试 |
+| `test/server.cpp` | 从顶层移入 test/，改用 Options + 环境变量配置 |
+| `test/client.cpp` | 从顶层移入 test/，精简为独立测试工具 |
+| `app_example/` | 外部库使用示例（find_package + link） |
+| ~~`util.cpp` / `util.h`~~ | **已移除**（errif 全部替换为 Logger） |
 
 ## 构建 & 运行
 
 ```bash
-cd HISTORY/day27
+cd HISTORY/day28
 cmake -S . -B build && cmake --build build -j4
 
-# 启动服务器
-./build/http_server
+# 纯策略测试（不需要网络）
+./build/BackpressureDecisionTest
+./build/TcpServerPolicyTest
+./build/SocketPolicyTest
+./build/HttpContextTest
 
-# 压测（对比 day26 QPS）
-./build/BenchmarkTest 127.0.0.1 8888 / 4 10
+# Linux 专属测试（macOS 自动跳过）
+./build/EpollPolicyTest
+
+# 启动 server + client
+./build/server &
+./build/client
 ```
 
 ## 可执行文件
 
 | 名称 | 说明 |
 |------|------|
-| `http_server` | HTTP 文件服务器（带静态缓存） |
-| `server` | Echo TCP 服务器 |
-| `client` | TCP 客户端 |
-| `BenchmarkTest` | 多线程 HTTP 压测工具 |
+| `server` | TCP Echo 服务器 (test/) |
+| `client` | TCP 客户端 (test/) |
+| `BackpressureDecisionTest` | 回压策略决策测试 |
+| `EpollPolicyTest` | epoll 自愈重试策略测试 |
+| `HttpContextTest` | HTTP 解析器测试 |
+| `SocketPolicyTest` | Socket 返回值语义测试 |
+| `TcpServerPolicyTest` | 连接上限 / 线程归一化测试 |
 | `LogTest` | 日志系统测试 |
 | `TimerTest` | 定时器测试 |
 | `ThreadPoolTest` | 线程池测试 |
 | `StressTest` | 压力测试客户端 |
+| `BenchmarkTest` | HTTP 压测工具 |
 
-## 核心优化
+## 核心设计
 
-| 优化 | 效果 |
-|------|------|
-| `g_staticCache` 预加载 | 请求热路径零磁盘 I/O，QPS +15-20% |
-| `send(string&&)` | 小响应直写路径零拷贝，避免 OutputBuffer 中转 |
-| `bodyLen_` 缓存 | 大文件分段上传消除重复 unordered_map 查找 |
-| Socket 诊断 | errno + strerror 详细日志，快速定位网络故障 |
+- **纯策略函数**：`evaluateBackpressure()` / `shouldRejectNewConnection()` 等零副作用纯函数，可直接在单元测试中覆盖全部边界
+- **回压机制**：low/high/hard 三级水位线，自动暂停/恢复/断连
+- **连接上限**：`maxConnections` 超限时直接 close(fd)，保护服务器
+- **HTTP Pipeline**：`consumed` 出参精确追踪每条请求消费的字节数
+- **外部库示例**：`app_example/` 演示 find_package + target_link_libraries 完整集成流程

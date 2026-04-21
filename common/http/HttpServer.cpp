@@ -6,7 +6,13 @@
 #include "timer/TimeStamp.h"
 #include <functional>
 
-HttpServer::HttpServer() : server_(std::make_unique<TcpServer>()) {
+HttpServer::HttpServer() : HttpServer(Options{}) {}
+
+HttpServer::HttpServer(const Options &options)
+    : server_(std::make_unique<TcpServer>(options.tcp)) {
+    autoClose_ = options.autoClose;
+    idleTimeout_ = options.idleTimeoutSec > 0.0 ? options.idleTimeoutSec : 60.0;
+
     // 注册 TCP 层回调，桥接到 HTTP 处理逻辑
     server_->newConnect(std::bind(&HttpServer::onNewConnection, this, std::placeholders::_1));
     server_->onMessage(std::bind(&HttpServer::onMessage, this, std::placeholders::_1));
@@ -76,28 +82,38 @@ void HttpServer::onMessage(Connection *conn) {
         conn->touchLastActive();
 
     Buffer *buf = conn->getInputBuffer();
-    const char *data = buf->peek();
-    int len = static_cast<int>(buf->readableBytes());
+    // 关键修复：同一个 TCP 包中可能包含多个 HTTP 请求（pipeline / 粘包）。
+    // 逐轮 parse + 按“实际消费字节”retrieve，避免把后续请求误清空。
+    while (buf->readableBytes() > 0) {
+        int consumed = 0;
+        if (!ctx->parse(buf->peek(), static_cast<int>(buf->readableBytes()), &consumed)) {
+            LOG_WARN << "[HttpServer] 非法请求，fd=" << conn->getSocket()->getFd();
+            conn->send("HTTP/1.1 400 Bad Request\r\n\r\n");
+            conn->close();
+            return;
+        }
 
-    if (!ctx->parse(data, len)) {
-        // 报文格式非法
-        LOG_WARN << "[HttpServer] bad request, fd=" << conn->getSocket()->getFd();
-        conn->send("HTTP/1.1 400 Bad Request\r\n\r\n");
-        conn->close();
-        return;
-    }
+        if (consumed > 0) {
+            buf->retrieve(static_cast<size_t>(consumed));
+        } else {
+            // 理论上 len>0 时应至少消费 1 字节。该保护用于规避异常输入导致的死循环。
+            LOG_WARN << "[HttpServer] 解析未前进，等待更多数据，fd="
+                     << conn->getSocket()->getFd();
+            break;
+        }
 
-    // 消耗掉已经被状态机读取的字节
-    buf->retrieve(buf->readableBytes());
+        // 只解析到半包时先退出，等待下一个 read 事件继续。
+        if (!ctx->isComplete())
+            break;
 
-    if (ctx->isComplete()) {
-        onRequest(conn, ctx->request());
-        ctx->reset(); // 准备解析下一个请求（keep-alive）
+        if (!onRequest(conn, ctx->request()))
+            return;
+        ctx->reset();
     }
 }
 
 // ── 完整请求到达：调用业务回调，序列化并发送响应 ───────────────────────────────
-void HttpServer::onRequest(Connection *conn, const HttpRequest &req) {
+bool HttpServer::onRequest(Connection *conn, const HttpRequest &req) {
     const std::string connHeader = req.header("Connection");
 
     // HTTP/1.0 默认关闭；HTTP/1.1 默认 keep-alive，除非显式 "Connection: close"
@@ -113,8 +129,11 @@ void HttpServer::onRequest(Connection *conn, const HttpRequest &req) {
 
     conn->send(resp.serialize());
 
-    if (resp.closeConnection())
+    if (resp.closeConnection()) {
         conn->close();
+        return false;
+    }
+    return true;
 }
 
 void HttpServer::defaultCallback(const HttpRequest & /*req*/, HttpResponse *resp) {

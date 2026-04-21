@@ -1,16 +1,27 @@
 #include "Socket.h"
 #include "InetAddress.h"
-#include "util.h"
+#include "log/Logger.h"
+
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 Socket::Socket() : fd_(-1) {
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    ErrIf(fd_ == -1, "socket create error");
+    if (fd_ == -1) {
+        LOG_ERROR << "[Socket] socket 创建失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+    }
 }
 
-Socket::Socket(int _fd) : fd_(_fd) { ErrIf(fd_ == -1, "socket create error"); }
+Socket::Socket(int _fd) : fd_(_fd) {
+    if (fd_ == -1) {
+        LOG_ERROR << "[Socket] 使用无效 fd 初始化，错误=" << strerror(EBADF)
+                  << " errno=" << EBADF;
+    }
+}
 
 Socket::~Socket() {
     if (fd_ != -1) {
@@ -19,31 +30,86 @@ Socket::~Socket() {
     }
 }
 
-void Socket::bind(InetAddress *addr) {
-    ErrIf(::bind(fd_, reinterpret_cast<sockaddr *>(&addr->addr), addr->addr_len) == -1,
-          "socket bind error");
+bool Socket::bind(InetAddress *addr) {
+    if (fd_ == -1) {
+        errno = EBADF;
+        LOG_ERROR << "[Socket] bind 失败：fd 无效";
+        return false;
+    }
+    if (::bind(fd_, reinterpret_cast<sockaddr *>(&addr->addr), addr->addr_len) == -1) {
+        LOG_ERROR << "[Socket] bind 失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+        return false;
+    }
+    return true;
 }
 
-void Socket::listen() { ErrIf(::listen(fd_, SOMAXCONN), "socket listen error"); }
+bool Socket::listen() {
+    if (fd_ == -1) {
+        errno = EBADF;
+        LOG_ERROR << "[Socket] listen 失败：fd 无效";
+        return false;
+    }
+    if (::listen(fd_, SOMAXCONN) == -1) {
+        LOG_ERROR << "[Socket] listen 失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+        return false;
+    }
+    return true;
+}
 
 int Socket::accept(InetAddress *addr) {
+    if (fd_ == -1) {
+        errno = EBADF;
+        return -1;
+    }
     int client_sockfd =
         ::accept(fd_, reinterpret_cast<sockaddr *>(&addr->addr), &addr->addr_len);
-    ErrIf(client_sockfd == -1, "socket accept error");
     return client_sockfd;
 }
 
-void Socket::connect(InetAddress *addr) {
-    ErrIf(::connect(fd_, reinterpret_cast<sockaddr *>(&addr->addr), addr->addr_len) == -1,
-          "socket connect error");
+bool Socket::connect(InetAddress *addr) {
+    if (fd_ == -1) {
+        errno = EBADF;
+        LOG_ERROR << "[Socket] connect 失败：fd 无效";
+        return false;
+    }
+    if (::connect(fd_, reinterpret_cast<sockaddr *>(&addr->addr), addr->addr_len) == -1) {
+        LOG_ERROR << "[Socket] connect 失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+        return false;
+    }
+    return true;
 }
 
 int Socket::getFd() { return fd_; }
 
-void Socket::setnonblocking() {
+bool Socket::setnonblocking() {
+    if (fd_ == -1) {
+        errno = EBADF;
+        LOG_ERROR << "[Socket] 设置非阻塞失败：fd 无效";
+        return false;
+    }
     int oldoptions = fcntl(fd_, F_GETFL);
+    if (oldoptions == -1) {
+        LOG_ERROR << "[Socket] 获取 fd flags 失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+        return false;
+    }
     int new_option = oldoptions | O_NONBLOCK;
-    fcntl(fd_, F_SETFL, new_option);
+    if (fcntl(fd_, F_SETFL, new_option) == -1) {
+        LOG_ERROR << "[Socket] 设置非阻塞失败，错误=" << strerror(errno)
+                  << " errno=" << errno;
+        return false;
+    }
+    return true;
 }
 
-bool Socket::isNonBlocking() { return (fcntl(fd_, F_GETFL) & O_NONBLOCK) != 0; }
+bool Socket::isNonBlocking() {
+    if (fd_ == -1)
+        return false;
+    int flags = fcntl(fd_, F_GETFL);
+    if (flags == -1)
+        return false;
+    return (flags & O_NONBLOCK) != 0;
+}

@@ -3,26 +3,56 @@
 #include "Connection.h"
 #include "EventLoop.h"
 #include "EventLoopThreadPool.h"
-#include "Exception.h"
 #include "log/Logger.h"
 
 #include <algorithm>
 #include <functional>
 #include <thread>
+#include <unistd.h>
 
-TcpServer::TcpServer() {
+int TcpServer::normalizeIoThreadCount(int configured, unsigned int hardwareCount) {
+    if (configured > 0)
+        return configured;
+    if (hardwareCount == 0)
+        return 1;
+    return static_cast<int>(hardwareCount);
+}
+
+TcpServer::TcpServer() : TcpServer(Options{}) {}
+
+TcpServer::TcpServer(const Options &options) : options_(options) {
     mainReactor_ = std::make_unique<Eventloop>();
 
-    acceptor_ = std::make_unique<Acceptor>(mainReactor_.get());
+    acceptor_ = std::make_unique<Acceptor>(
+        mainReactor_.get(), options_.listenIp.c_str(), options_.listenPort);
     acceptor_->setNewConnectionCallback(
         std::bind(&TcpServer::newConnection, this, std::placeholders::_1));
 
-    // 至少 1 个 IO 线程；hardware_concurrency() 可能返回 0
-    int threadNum = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    int threadNum = normalizeIoThreadCount(options_.ioThreads,
+                                           std::thread::hardware_concurrency());
     threadPool_ = std::make_unique<EventLoopThreadPool>(mainReactor_.get());
     threadPool_->setThreadNums(threadNum);
 
-    LOG_INFO << "[TcpServer] Main Reactor + " << threadNum << " Sub Reactors ready.";
+    if (options_.maxConnections > 0)
+        maxConnections_ = options_.maxConnections;
+
+    LOG_INFO << "[TcpServer] Main Reactor + " << threadNum
+             << " Sub Reactors ready. listen=" << options_.listenIp
+             << ":" << options_.listenPort
+             << " maxConnections=" << maxConnections_;
+}
+
+void TcpServer::setMaxConnections(size_t maxConnections) {
+    if (maxConnections == 0) {
+        LOG_WARN << "[TcpServer] 最大连接数不能为0，忽略本次设置";
+        return;
+    }
+    maxConnections_ = maxConnections;
+    LOG_INFO << "[TcpServer] 最大连接数已更新: " << maxConnections_;
+}
+
+bool TcpServer::shouldRejectNewConnection(size_t currentCount, size_t maxConnections) {
+    return currentCount >= maxConnections;
 }
 
 void TcpServer::Start() {
@@ -36,8 +66,18 @@ void TcpServer::Start() {
 }
 
 void TcpServer::newConnection(int fd) {
-    if (fd == -1)
-        throw Exception(ExceptionType::INVALID_SOCKET, "newConnection: invalid fd");
+    if (fd == -1) {
+        LOG_WARN << "[TcpServer] 收到无效连接 fd=-1，已忽略";
+        return;
+    }
+
+    if (shouldRejectNewConnection(connections_.size(), maxConnections_)) {
+        LOG_WARN << "[TcpServer] 连接数达到上限，拒绝新连接 fd=" << fd
+                 << " current=" << connections_.size()
+                 << " max=" << maxConnections_;
+        ::close(fd);
+        return;
+    }
 
     // 轮询选择一个 sub-reactor 归属这条连接
     Eventloop *subLoop = threadPool_->nextLoop();

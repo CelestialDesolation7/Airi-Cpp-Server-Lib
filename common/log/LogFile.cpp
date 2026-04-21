@@ -4,9 +4,7 @@
 #include <ctime>
 
 LogFile::LogFile(const std::string &basename, size_t rollSizeBytes)
-    : basename_(basename), rollSizeBytes_(rollSizeBytes), writtenBytes_(0), fp_(nullptr) {
-    rollFile(); // 构造时立即创建第一个日志文件
-}
+    : basename_(basename), rollSizeBytes_(rollSizeBytes), writtenBytes_(0), fp_(nullptr) {}
 
 LogFile::~LogFile() {
     if (fp_) {
@@ -40,7 +38,7 @@ void LogFile::rollFile() {
 }
 
 void LogFile::append(const char *data, int len) {
-    if (writtenBytes_ + static_cast<size_t>(len) > rollSizeBytes_) {
+    if (!fp_ || writtenBytes_ + static_cast<size_t>(len) > rollSizeBytes_) {
         rollFile();
     }
     size_t written = fwrite(data, 1, static_cast<size_t>(len), fp_);

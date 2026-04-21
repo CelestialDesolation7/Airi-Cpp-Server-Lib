@@ -25,6 +25,43 @@ Connection::Connection(int fd, Eventloop *loop)
     state_ = State::kConnected;
 }
 
+bool Connection::isValidBackpressureConfig(const BackpressureConfig &cfg) {
+    return cfg.lowWatermarkBytes > 0 &&
+           cfg.lowWatermarkBytes < cfg.highWatermarkBytes &&
+           cfg.highWatermarkBytes < cfg.hardLimitBytes;
+}
+
+Connection::BackpressureDecision Connection::evaluateBackpressure(
+    size_t bufferedBytes,
+    bool readPaused,
+    const BackpressureConfig &cfg) {
+    BackpressureDecision d;
+    if (bufferedBytes > cfg.hardLimitBytes) {
+        d.shouldCloseConnection = true;
+        return d;
+    }
+    if (!readPaused && bufferedBytes > cfg.highWatermarkBytes)
+        d.shouldPauseRead = true;
+    if (readPaused && bufferedBytes <= cfg.lowWatermarkBytes)
+        d.shouldResumeRead = true;
+    return d;
+}
+
+void Connection::setBackpressureConfig(const BackpressureConfig &cfg) {
+    if (!isValidBackpressureConfig(cfg)) {
+        LOG_WARN << "[连接] 回压配置非法，忽略本次设置"
+                 << " low=" << cfg.lowWatermarkBytes
+                 << " high=" << cfg.highWatermarkBytes
+                 << " hard=" << cfg.hardLimitBytes;
+        return;
+    }
+    backpressureConfig_ = cfg;
+    LOG_INFO << "[连接] 回压配置已更新"
+             << " low=" << backpressureConfig_.lowWatermarkBytes
+             << " high=" << backpressureConfig_.highWatermarkBytes
+             << " hard=" << backpressureConfig_.hardLimitBytes;
+}
+
 Connection::~Connection() {
     // alive_ 置 false：通知所有持有 weak_ptr<bool> 的定时器回调此连接已销毁，
     // 避免回调在 Connection 内存释放后通过 raw pointer 访问悬空对象
@@ -65,21 +102,90 @@ void Connection::doRead() {
     // 指令流转移到 Business() 继续处理
 }
 
+void Connection::applyBackpressureAfterAppend() {
+    if (state_ != State::kConnected)
+        return;
+
+    BackpressureDecision d =
+        evaluateBackpressure(outputBuffer_.readableBytes(),
+                             readPausedByBackpressure_,
+                             backpressureConfig_);
+
+    if (d.shouldCloseConnection) {
+        state_ = State::kFailed;
+        LOG_ERROR << "[连接] 输出缓冲超出硬上限，触发保护性断连，fd=" << sock_->getFd()
+                  << " buffered=" << outputBuffer_.readableBytes()
+                  << " hard=" << backpressureConfig_.hardLimitBytes;
+        close();
+        return;
+    }
+
+    if (d.shouldPauseRead) {
+        channel_->disableReading();
+        readPausedByBackpressure_ = true;
+        LOG_WARN << "[连接] 触发回压，暂停读事件，fd=" << sock_->getFd()
+                 << " buffered=" << outputBuffer_.readableBytes()
+                 << " high=" << backpressureConfig_.highWatermarkBytes;
+    }
+}
+
+void Connection::tryResumeReadAfterDrain() {
+    if (state_ != State::kConnected)
+        return;
+
+    BackpressureDecision d =
+        evaluateBackpressure(outputBuffer_.readableBytes(),
+                             readPausedByBackpressure_,
+                             backpressureConfig_);
+    if (d.shouldResumeRead) {
+        channel_->enableReading();
+        readPausedByBackpressure_ = false;
+        LOG_INFO << "[连接] 回压解除，恢复读事件，fd=" << sock_->getFd()
+                 << " buffered=" << outputBuffer_.readableBytes()
+                 << " low=" << backpressureConfig_.lowWatermarkBytes;
+    }
+}
+
 void Connection::doWrite() {
     if (state_ != State::kConnected)
         return;
-    if (channel_->isWriting()) {
-        ssize_t n = ::write(sock_->getFd(), outputBuffer_.peek(), outputBuffer_.readableBytes());
-        // 不一定能一次全发出去
+    if (!channel_->isWriting())
+        return;
+
+    const int fd = sock_->getFd();
+
+    // ET 模式下写事件也应尽可能“写到 EAGAIN 为止”，避免残留数据长时间滞留。
+    while (outputBuffer_.readableBytes() > 0) {
+        ssize_t n = ::write(fd, outputBuffer_.peek(), outputBuffer_.readableBytes());
         if (n > 0) {
-            // 一部分数据已被输出，对应 Buffer 区域被划入废弃区域
-            outputBuffer_.retrieve(n);
-            // 如果全发完了，通知 epoll 本 channel 不再需要发数据
-            if (outputBuffer_.readableBytes() == 0) {
-                channel_->disableWriting();
-            }
+            outputBuffer_.retrieve(static_cast<size_t>(n));
+            continue;
         }
+
+        if (n == -1 && errno == EINTR) {
+            // 被信号中断，立即重试
+            continue;
+        }
+
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // 发送缓冲区暂满，保留写事件，等待下一次可写通知
+            break;
+        }
+
+        state_ = State::kFailed;
+        LOG_ERROR << "[连接] 写入失败，fd=" << fd << " errno=" << errno
+                  << " 错误=" << strerror(errno);
+        close();
+        return;
     }
+
+    if (outputBuffer_.readableBytes() == 0) {
+        // 全部发完后及时取消写关注，避免空转唤醒
+        channel_->disableWriting();
+    }
+
+    // 写缓冲下降后，尝试解除回压并恢复读事件。
+    tryResumeReadAfterDrain();
 }
 
 // ── 发送数据：先尝试直接 write，写不完再追加到 OutputBuffer ──────────────────
@@ -101,17 +207,31 @@ void Connection::send(const std::string &msg) {
             remaining = msg.size() - nwrote;
         } else {
             nwrote = 0;
-            if ((errno != EWOULDBLOCK) && (errno == EPIPE || errno == ECONNRESET)) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 faultError = true;
+                state_ = State::kFailed;
+                LOG_ERROR << "[连接] 发送失败(fd=" << sock_->getFd() << ")，错误="
+                          << strerror(errno);
+                close();
             }
         }
     }
 
     if (!faultError && remaining > 0) {
+        const size_t projected = outputBuffer_.readableBytes() + remaining;
+        if (projected > backpressureConfig_.hardLimitBytes) {
+            state_ = State::kFailed;
+            LOG_ERROR << "[连接] 发送前检测到缓冲即将超限，保护性断连，fd=" << sock_->getFd()
+                      << " projected=" << projected
+                      << " hard=" << backpressureConfig_.hardLimitBytes;
+            close();
+            return;
+        }
         outputBuffer_.append(msg.data() + nwrote, remaining);
         if (!channel_->isWriting()) {
             channel_->enableWriting();
         }
+        applyBackpressureAfterAppend();
     }
 }
 
@@ -134,17 +254,33 @@ void Connection::send(std::string &&msg) {
                 return;
         } else {
             nwrote = 0;
-            if ((errno != EWOULDBLOCK) && (errno == EPIPE || errno == ECONNRESET)) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 faultError = true;
+                state_ = State::kFailed;
+                LOG_ERROR << "[连接] 发送失败(fd=" << sock_->getFd() << ")，错误="
+                          << strerror(errno);
+                close();
             }
         }
     }
 
     if (!faultError && static_cast<size_t>(nwrote) < sz) {
-        outputBuffer_.append(msg.data() + nwrote, sz - nwrote);
+        const size_t remaining = sz - static_cast<size_t>(nwrote);
+        const size_t projected = outputBuffer_.readableBytes() + remaining;
+        if (projected > backpressureConfig_.hardLimitBytes) {
+            state_ = State::kFailed;
+            LOG_ERROR << "[连接] 发送前检测到缓冲即将超限，保护性断连，fd=" << sock_->getFd()
+                      << " projected=" << projected
+                      << " hard=" << backpressureConfig_.hardLimitBytes;
+            close();
+            return;
+        }
+
+        outputBuffer_.append(msg.data() + nwrote, remaining);
         if (!channel_->isWriting()) {
             channel_->enableWriting();
         }
+        applyBackpressureAfterAppend();
     }
 }
 
