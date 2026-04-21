@@ -5,7 +5,6 @@
 #include "Channel.h"
 #include "util.h"
 #include <cerrno>
-#include <cstring>
 #include <sys/event.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -13,11 +12,9 @@
 
 #define MAX_EVENTS 1024
 
-KqueuePoller::KqueuePoller(Eventloop *loop) : Poller(loop), kqueueFd_(-1), events_(nullptr) {
+KqueuePoller::KqueuePoller(Eventloop *loop) : Poller(loop), kqueueFd_(-1), events_(MAX_EVENTS) {
     kqueueFd_ = kqueue();
     ErrIf(kqueueFd_ == -1, "[server] kqueue create error.");
-    events_ = new struct kevent[MAX_EVENTS]; // Bug修复1
-    memset(events_, 0, sizeof(struct kevent) * MAX_EVENTS);
 }
 
 KqueuePoller::~KqueuePoller() {
@@ -25,7 +22,7 @@ KqueuePoller::~KqueuePoller() {
         close(kqueueFd_);
         kqueueFd_ = -1;
     }
-    delete[] events_;
+    // events_ 是 std::vector，析构时自动释放
 }
 
 void KqueuePoller::updateChannel(Channel *channel) {
@@ -79,7 +76,7 @@ std::vector<Channel *> KqueuePoller::poll(int timeout) {
         ts.tv_nsec = (long)(timeout % 1000) * 1000000;
         pts = &ts;
     }
-    int nfds = kevent(kqueueFd_, nullptr, 0, events_, MAX_EVENTS, pts);
+    int nfds = kevent(kqueueFd_, nullptr, 0, events_.data(), MAX_EVENTS, pts);
     if (nfds == -1) {
         if (errno != EINTR)
             ErrIf(true, "[server] kqueue wait error.");

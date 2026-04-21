@@ -1,6 +1,8 @@
 #pragma once
 #include "Macros.h"
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <sys/types.h>
 #include <vector>
@@ -12,9 +14,10 @@ class Eventloop {
     DISALLOW_COPY_AND_MOVE(Eventloop);
 
   private:
-    Poller *poller_{nullptr};
-    Channel *evtChannel_{nullptr};
-    bool quit_{false};
+    // unique_ptr 析构顺序 = 声明逆序：evtChannel_ 先析构（从 poller 注销），然后 poller_ 析构
+    std::unique_ptr<Poller> poller_;
+    std::unique_ptr<Channel> evtChannel_;
+    std::atomic<bool> quit_{false};
     std::vector<std::function<void()>> pendingFunctors_;
     std::mutex mutex_;
 

@@ -3,6 +3,7 @@
 #include "Poller/Poller.h"
 #include "util.h"
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <unistd.h>
 #include <vector>
@@ -14,12 +15,12 @@
 #endif
 
 Eventloop::Eventloop() : poller_(nullptr), quit_(false) {
-    poller_ = Poller::newDefaultPoller(this); // 用工厂，不 new 具体类
+    poller_ = Poller::newDefaultPoller(this); // 工厂返回 unique_ptr，直接 move 赋值
 
 #ifdef __linux__
     evtfd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     ErrIf(evtfd_ == -1, "eventfd create error.");
-    evtChannel_ = new Channel(this, evtfd_);
+    evtChannel_ = std::make_unique<Channel>(this, evtfd_);
 #elif defined(__APPLE__)
     int pipeFds[2];
     ErrIf(pipe(pipeFds) == -1, "pipe create error.");
@@ -27,7 +28,7 @@ Eventloop::Eventloop() : poller_(nullptr), quit_(false) {
     wakeupWriteFd_ = pipeFds[1];
     fcntl(wakeupReadFd_, F_SETFL, fcntl(wakeupReadFd_, F_GETFL) | O_NONBLOCK);
     fcntl(wakeupWriteFd_, F_SETFL, fcntl(wakeupWriteFd_, F_GETFL) | O_NONBLOCK);
-    evtChannel_ = new Channel(this, wakeupReadFd_);
+    evtChannel_ = std::make_unique<Channel>(this, wakeupReadFd_);
 #endif
 
     evtChannel_->setReadCallback(std::bind(&Eventloop::handleWakeup, this));
@@ -36,8 +37,9 @@ Eventloop::Eventloop() : poller_(nullptr), quit_(false) {
 }
 
 Eventloop::~Eventloop() {
-    delete evtChannel_;
-    delete poller_;
+    // evtChannel_（unique_ptr）先析构（声明在 poller_ 之后，逆序析构）
+    // poller_（unique_ptr）后析构——Channel 已注销后再销毁 poller，顺序安全
+    // 文件描述符由平台 OS 对象管理，仍需手动关闭
 #ifdef __linux__
     close(evtfd_);
 #elif defined(__APPLE__)

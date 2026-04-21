@@ -4,7 +4,6 @@
 #include "Poller/Poller.h"
 #include "util.h"
 #include <cstddef>
-#include <cstring>
 #include <ctime>
 #include <unistd.h>
 #include <vector>
@@ -14,11 +13,9 @@
 #include <cerrno>
 #include <sys/epoll.h>
 
-EpollPoller::EpollPoller(Eventloop *loop) : Poller(loop), epollFd_(-1), events_(nullptr) {
+EpollPoller::EpollPoller(Eventloop *loop) : Poller(loop), epollFd_(-1), events_(MAX_EVENTS) {
     epollFd_ = epoll_create1(0);
     ErrIf(epollFd_ == -1, "epoll create error");
-    events_ = new epoll_event[MAX_EVENTS];
-    memset(events_, 0, sizeof(epoll_event) * MAX_EVENTS);
 }
 
 EpollPoller::~EpollPoller() {
@@ -26,13 +23,12 @@ EpollPoller::~EpollPoller() {
         close(epollFd_);
         epollFd_ = -1;
     }
-    delete[] events_;
+    // events_ 是 std::vector，析构时自动释放
 }
 
 void EpollPoller::updateChannel(Channel *channel) {
     int fd = channel->getFd();
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof(ev));
+    struct epoll_event ev{};
     ev.data.ptr = channel;
 
     // 原本的 ev.events = channel->getEvents(); 需要在 channel 类全局引入 linux 上的 sys/epoll.h
@@ -59,7 +55,7 @@ void EpollPoller::deleteChannel(Channel *channel) {
 
 std::vector<Channel *> EpollPoller::poll(int timeout) {
     std::vector<Channel *> activeChannels;
-    int nfds = epoll_wait(epollFd_, events_, MAX_EVENTS, timeout);
+    int nfds = epoll_wait(epollFd_, events_.data(), MAX_EVENTS, timeout);
     ErrIf(nfds == -1 && errno != EINTR, "epoll wait error");
 
     for (int i = 0; i < nfds; ++i) {

@@ -20,7 +20,7 @@ class ThreadPool {
     ~ThreadPool();
 
     template <class F, class... Args>
-    auto add(F &&f, Args &&...args) -> std::future<typename std::result_of<F(Args...)>::type>;
+    auto add(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>>;
     // 定义一个函数叫 add。它能接收任何可调用对象 f，以及任意多个参数 args。
     // 它的返回类型是 std::future，里面包裹的类型，就是 f 运行后产生的那个结果类型。
 
@@ -38,11 +38,10 @@ class ThreadPool {
 
 // 模板实现
 template <class F, class... Args>
-auto ThreadPool::add(F &&f, Args &&...args)
-    -> std::future<typename std::result_of<F(Args...)>::type> {
+auto ThreadPool::add(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>> {
 
     // 编译期计算：如果用参数 Args 调用 F，返回值的类型
-    using return_type = typename std::result_of<F(Args...)>::type;
+    using return_type = std::invoke_result_t<F, Args...>;
 
     // 1. std::forward: 完美转发。如果 args 是右值（临时对象），保持其右值属性，
     //    以便 bind 能移动它们而不是复制它们（性能优化）。

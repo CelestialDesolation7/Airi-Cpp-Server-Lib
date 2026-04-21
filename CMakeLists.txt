@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(day20 LANGUAGES CXX)
+project(day21 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,8 @@ add_executable(server
     common/Buffer.cpp
     common/Channel.cpp
     common/Connection.cpp
+    common/EventLoopThread.cpp
+    common/EventLoopThreadPool.cpp
     common/Eventloop.cpp
     common/InetAddress.cpp
     common/TcpServer.cpp

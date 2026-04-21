@@ -5,11 +5,12 @@
 
 #include "Poller.h"
 #include <sys/event.h>
+#include <vector>
 
 class KqueuePoller : public Poller {
   private:
     int kqueueFd_{-1};
-    struct kevent *events_{nullptr};
+    std::vector<struct kevent> events_;
 
   public:
     explicit KqueuePoller(Eventloop *loop);

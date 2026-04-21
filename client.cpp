@@ -32,6 +32,7 @@ int main() {
     while (true) {
         char buf[1024];
         bzero(buf, sizeof(buf));
+        std::cout << "[等待输入] " << std::flush;
         if (fgets(buf, sizeof(buf), stdin) == NULL) {
             // 读到EOF退出客户端
             break;
@@ -44,7 +45,10 @@ int main() {
         if (len == 0)
             continue;
 
-        ssize_t write_bytes = write(sockfd, buf, sizeof(buf));
+        // 只发送实际消息字节数（len），不发 sizeof(buf) 的 null 填充
+        // 发送 sizeof(buf) 会导致服务器收到 1024 字节（含大量 null），
+        // 超长文本分多次 fgets 时，echo 字节数与 read 期望字节数错位，造成卡死
+        ssize_t write_bytes = write(sockfd, buf, len);
 
         if (write_bytes == -1) {
             std::cout << "[客户端] socket连接已经关闭，无法再写入数据\n";

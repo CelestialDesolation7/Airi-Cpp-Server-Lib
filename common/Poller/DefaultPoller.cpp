@@ -1,4 +1,5 @@
 #include "Poller/Poller.h"
+#include <memory>
 
 #ifdef __linux__
 #include "Poller/EpollPoller.h"
@@ -8,10 +9,10 @@
 #error "OS not supported!"
 #endif
 
-Poller *Poller::newDefaultPoller(Eventloop *loop) {
+std::unique_ptr<Poller> Poller::newDefaultPoller(Eventloop *loop) {
 #ifdef __linux__
-    return new EpollPoller(loop);
+    return std::make_unique<EpollPoller>(loop);
 #else
-    return new KqueuePoller(loop);
+    return std::make_unique<KqueuePoller>(loop);
 #endif
 }

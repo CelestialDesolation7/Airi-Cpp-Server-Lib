@@ -1,5 +1,6 @@
 #pragma once
 #include "Macros.h"
+#include <memory>
 #include <vector>
 
 class Channel;
@@ -19,6 +20,6 @@ class Poller {
     virtual void deleteChannel(Channel *channel) = 0;
     virtual std::vector<Channel *> poll(int timeout = -1) = 0;
 
-    // 静态工厂方法
-    static Poller *newDefaultPoller(Eventloop *loop);
+    // 静态工厂方法，返回 unique_ptr 以明确所有权
+    static std::unique_ptr<Poller> newDefaultPoller(Eventloop *loop);
 };

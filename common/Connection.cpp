@@ -32,28 +32,40 @@ Connection::~Connection() {
 
 void Connection::doRead() {
     int sockfd = sock_->getFd();
-    int savedErrno = 0;
-    ssize_t n = inputBuffer_.readFd(sockfd, &savedErrno);
-
-    if (n == 0) {
-        state_ = State::kClosed;
-        std::cout << "[server] client fd " << sockfd << " disconnected." << std::endl;
-        // 不在此处调用 close()，由 Business() 在所有回调完成后统一触发
-        // 防止 close() → queueInLoop(删除) 后 Main Reactor 立刻析构 Connection
-        // 而 Business() 中 onMessageCallback_(this) 尚未执行完毕，导致 use-after-free
-    } else if (n < 0) {
-        if (savedErrno != EAGAIN && savedErrno != EWOULDBLOCK) {
+    // ET 模式必须循环读直到 EAGAIN，否则状态只变化一次，内核不再通知，
+    // 导致缓冲区中残留数据却永远不被读取，客户端卡死在 read 等待 echo
+    while (true) {
+        int savedErrno = 0;
+        ssize_t n = inputBuffer_.readFd(sockfd, &savedErrno);
+        if (n > 0) {
+            // 本次读到数据，继续循环尝试读取更多（ET 模式可能有大量数据）
+            continue;
+        } else if (n == 0) {
+            state_ = State::kClosed;
+            std::cout << "[server] client fd " << sockfd << " disconnected." << std::endl;
+            // 不在此处调用 close()，由 Business() 在所有回调完成后统一触发
+            // 防止 close() → queueInLoop(删除) 后 Main Reactor 立刻析构 Connection
+            // 而 Business() 中 onMessageCallback_(this) 尚未执行完毕，导致 use-after-free
+            break;
+        } else {
+            if (savedErrno == EAGAIN || savedErrno == EWOULDBLOCK) {
+                // 内核缓冲区已读空，ET 下这是正常退出条件
+                break;
+            }
             state_ = State::kFailed;
             std::cerr << "[server] read error on fd " << sockfd << ": " << strerror(savedErrno)
                       << std::endl;
             // 同上，由 Business() 统一触发删除
+            break;
         }
     }
-    // 若 n > 0，数据已被读入 inputBuffer
-    // 此函数返回后指令流将转移到 Business() 中
+    // 执行到此处：数据已尽数读入 inputBuffer（或连接异常）
+    // 指令流转移到 Business() 继续处理
 }
 
 void Connection::doWrite() {
+    if (state_ != State::kConnected)
+        return;
     if (channel_->isWriting()) {
         ssize_t n = ::write(sock_->getFd(), outputBuffer_.peek(), outputBuffer_.readableBytes());
         // 不一定能一次全发出去
@@ -102,6 +114,14 @@ void Connection::send(const std::string &msg) {
 }
 
 void Connection::Business() {
+    // 状态守卫：kqueue/epoll 的同一批次事件中，同一 fd 可能出现多次
+    // （如 EVFILT_READ + EVFILT_WRITE 同帧返回）。
+    // 若第一个事件已经探测到 EOF/错误并触发 close()，Connection 尚未被删除
+    // （删除是异步的，通过 queueInLoop 投递到本线程的 doPendingFunctors() 延迟执行），
+    // 第二个事件不应再进入 doRead() 对一个关闭中的 fd 做读写。
+    if (state_ != State::kConnected)
+        return;
+
     doRead();
     if (state_ == State::kConnected) {
         // 连接正常：执行业务回调

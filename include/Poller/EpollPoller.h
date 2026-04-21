@@ -3,11 +3,12 @@
 
 #include "Poller.h"
 #include <sys/epoll.h>
+#include <vector>
 
 class EpollPoller : public Poller {
   private:
     int epollFd_;
-    struct epoll_event *events_; // 平台独有的数据结构
+    std::vector<struct epoll_event> events_;
 
   public:
     explicit EpollPoller(Eventloop *loop);
