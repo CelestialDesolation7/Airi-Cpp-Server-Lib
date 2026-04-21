@@ -2,14 +2,6 @@
 
 #include <cassert>
 
-#ifdef __linux__
-#define OS_LINUX
-#endif
-
-#ifdef __APPLE__
-#define OS_MACOS
-#endif
-
 #define DISALLOW_COPY(cname)                                                                       \
     cname(const cname &) = delete;                                                                 \
     cname &operator=(const cname &) = delete;

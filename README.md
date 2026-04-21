@@ -1,10 +1,10 @@
-# Day 17 — 跨平台 Poller：用 `#ifdef` 统一 epoll/kqueue
+# Day 18 — Poller 策略模式拆分 + Airi-Cpp-Server-Lib 伞形头文件
 
 ## 核心变更
-- **删除 `Epoll.h/cpp`**，新增 `Poller.h/cpp`：同一文件内 `#ifdef OS_LINUX` epoll / `#ifdef OS_MACOS` kqueue 两套实现
-- **`Macros.h`** 新增平台检测宏 `OS_LINUX` / `OS_MACOS`
-- **`Channel`** 移除 `<sys/epoll.h>` 依赖，使用自定义标志 `READ_EVENT / WRITE_EVENT / ET`
-- **`Eventloop`** 条件编译 eventfd（Linux）/ pipe（macOS）唤醒机制
+- **Poller 拆分为策略模式**：抽象基类 `Poller` + `EpollPoller`（Linux）+ `KqueuePoller`（macOS）+ `DefaultPoller.cpp` 工厂
+- **新增 `Airi-Cpp-Server-Lib.h`** 伞形头文件
+- **`Macros.h`** 移除自定义 `OS_LINUX/OS_MACOS`，改用编译器预定义 `__linux__` / `__APPLE__`
+- **`Eventloop`** 改用 `Poller::newDefaultPoller(this)` 工厂创建
 
 ## 构建
 
@@ -20,13 +20,17 @@ cmake --build build -j4
 ```
 ├── server.cpp / client.cpp         入口
 ├── include/
-│   ├── Poller.h                    跨平台 IO 多路复用（新增）
-│   ├── Channel.h                   平台中立标志位
-│   ├── EventLoop.h                 条件编译唤醒机制
-│   ├── Macros.h                    OS_LINUX / OS_MACOS 宏
+│   ├── Poller/
+│   │   ├── Poller.h                抽象基类 + 工厂方法
+│   │   ├── EpollPoller.h           Linux epoll 实现
+│   │   └── KqueuePoller.h          macOS kqueue 实现
+│   ├── Airi-Cpp-Server-Lib.h            伞形头文件（新增）
 │   └── ...
 ├── common/
-│   ├── Poller.cpp                  epoll/kqueue 双实现（新增）
+│   ├── Poller/
+│   │   ├── DefaultPoller.cpp       工厂：按平台创建具体 Poller
+│   │   ├── epoll/EpollPoller.cpp   epoll 实现
+│   │   └── kqueue/KqueuePoller.cpp kqueue 实现
 │   └── ...
 └── test/                           ThreadPoolTest / StressTest
 ```

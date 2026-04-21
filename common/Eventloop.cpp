@@ -1,35 +1,30 @@
 #include "EventLoop.h"
 #include "Channel.h"
-#include "Poller.h"
+#include "Poller/Poller.h"
 #include "util.h"
 #include <functional>
 #include <mutex>
-#include <sys/types.h>
 #include <unistd.h>
 #include <vector>
 
-#ifdef OS_LINUX
+#ifdef __linux__
 #include <sys/eventfd.h>
-#endif
-
-#ifdef OS_MACOS
+#elif defined(__APPLE__)
 #include <fcntl.h>
 #endif
 
 Eventloop::Eventloop() : poller_(nullptr), quit_(false) {
-    poller_ = new Poller(); // 这个是我们自定义的epoll，不是OS给的
+    poller_ = Poller::newDefaultPoller(this); // 用工厂，不 new 具体类
 
-#ifdef OS_LINUX
+#ifdef __linux__
     evtfd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    ErrIf(evtfd_ == -1, "[server] eventfd create error in Eventloop.");
+    ErrIf(evtfd_ == -1, "eventfd create error.");
     evtChannel_ = new Channel(this, evtfd_);
-#endif
-#ifdef OS_MACOS
+#elif defined(__APPLE__)
     int pipeFds[2];
-    ErrIf(pipe(pipeFds) == -1, "[server] pipe create error in Eventloop.");
+    ErrIf(pipe(pipeFds) == -1, "pipe create error.");
     wakeupReadFd_ = pipeFds[0];
     wakeupWriteFd_ = pipeFds[1];
-
     fcntl(wakeupReadFd_, F_SETFL, fcntl(wakeupReadFd_, F_GETFL) | O_NONBLOCK);
     fcntl(wakeupWriteFd_, F_SETFL, fcntl(wakeupWriteFd_, F_GETFL) | O_NONBLOCK);
     evtChannel_ = new Channel(this, wakeupReadFd_);
@@ -37,26 +32,25 @@ Eventloop::Eventloop() : poller_(nullptr), quit_(false) {
 
     evtChannel_->setReadCallback(std::bind(&Eventloop::handleWakeup, this));
     evtChannel_->enableReading();
+    // 唤醒 channel 不启用 ET，用 LT，确保每次都能被读到
 }
 
 Eventloop::~Eventloop() {
     delete evtChannel_;
     delete poller_;
-#ifdef OS_LINUX
+#ifdef __linux__
     close(evtfd_);
-#endif
-#ifdef OS_MACOS
+#elif defined(__APPLE__)
     close(wakeupReadFd_);
     close(wakeupWriteFd_);
 #endif
 }
 
 void Eventloop::handleWakeup() {
-#ifdef OS_LINUX
-    uint64_t i = 1;
-    (void)read(evtfd_, &i, sizeof(i));
-#endif
-#ifdef OS_MACOS
+#ifdef __linux__
+    uint64_t val;
+    (void)read(evtfd_, &val, sizeof(val));
+#elif defined(__APPLE__)
     char buf[256];
     while (read(wakeupReadFd_, buf, sizeof(buf)) > 0) {
     }
@@ -64,11 +58,10 @@ void Eventloop::handleWakeup() {
 }
 
 void Eventloop::wakeup() {
-#ifdef OS_LINUX
-    uint64_t i = 1;
-    (void)write(evtfd_, &i, sizeof(i));
-#endif
-#ifdef OS_MACOS
+#ifdef __linux__
+    uint64_t one = 1;
+    (void)write(evtfd_, &one, sizeof(one));
+#elif defined(__APPLE__)
     char buf = 'w';
     (void)write(wakeupWriteFd_, &buf, 1);
 #endif
@@ -76,11 +69,9 @@ void Eventloop::wakeup() {
 
 void Eventloop::loop() {
     while (!quit_) {
-        std::vector<Channel *> channels;
-        channels = poller_->poll(); // 这里会返回
-        for (auto it = channels.begin(); it != channels.end(); ++it) {
-            (*it)->handleEvent();
-        }
+        std::vector<Channel *> channels = poller_->poll();
+        for (auto *ch : channels)
+            ch->handleEvent();
         doPendingFunctors();
     }
 }
@@ -99,14 +90,9 @@ void Eventloop::doPendingFunctors() {
         std::unique_lock<std::mutex> lock(mutex_);
         functors.swap(pendingFunctors_);
     }
-    for (const auto &func : functors) {
+    for (const auto &func : functors)
         func();
-    }
 }
 
-void Eventloop::updateChannel(Channel *ch) {
-    poller_->updateChannel(ch);
-    // 以后要更新channel走eventloop中转
-}
-
-void Eventloop::setQuit() { this->quit_ = true; }
+void Eventloop::updateChannel(Channel *ch) { poller_->updateChannel(ch); }
+void Eventloop::setQuit() { quit_ = true; }

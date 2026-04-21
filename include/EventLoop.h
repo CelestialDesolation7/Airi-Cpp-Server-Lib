@@ -18,11 +18,9 @@ class Eventloop {
     std::vector<std::function<void()>> pendingFunctors_;
     std::mutex mutex_;
 
-#ifdef OS_LINUX
-    int evtfd_;
-#endif
-
-#ifdef OS_MACOS
+#ifdef __linux__
+    int evtfd_{-1};
+#elif defined(__APPLE__)
     int wakeupReadFd_{-1};
     int wakeupWriteFd_{-1};
 #endif
@@ -33,7 +31,6 @@ class Eventloop {
   public:
     Eventloop();
     ~Eventloop();
-
     void loop();
     void setQuit();
     void updateChannel(Channel *ch);
