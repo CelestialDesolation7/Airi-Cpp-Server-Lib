@@ -49,6 +49,6 @@ class TimerQueue {
 
     void insert(Timer *timer); // 将 Timer 插入有序集合
 
-    Eventloop *loop_;        // 归属 EventLoop（不拥有）
-    std::set<Entry> timers_; // 按到期时刻有序的定时器集合
+    [[maybe_unused]] Eventloop *loop_; // 归属 EventLoop（留作断言/调试用，运行时不使用）
+    std::set<Entry> timers_;           // 按到期时刻有序的定时器集合
 };

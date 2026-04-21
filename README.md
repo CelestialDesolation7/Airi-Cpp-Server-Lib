@@ -1,37 +1,30 @@
-# Day 26 — HTTP 应用层演示
+# Day 27 — 调试与性能优化
 
-在 Day 25 的 HTTP 协议栈之上构建完整的文件服务器应用：首页、登录表单、文件上传/下载/删除，以及空闲连接自动超时关闭。
+针对 Day 26 HTTP 应用在压测中暴露的性能瓶颈进行系统优化：静态文件内存缓存、Connection::send 移动语义、HttpContext 解析热路径加速、Socket 错误诊断增强。
 
-## 新增 / 变更模块
+## 变更模块
 
 | 文件 | 说明 |
 |------|------|
-| `http_server.cpp` | 完整 HTTP 文件服务器（6 路由：首页、登录、文件列表、下载、删除、上传） |
-| `include/Connection.h` | 新增 `alive_` (shared_ptr<bool>)、`touchLastActive()`、`lastActive()` |
-| `common/Connection.cpp` | 析构时 `*alive_ = false`；Read() 中更新 lastActive |
-| `include/http/HttpRequest.h` | 新增 `appendBody()` 避免 O(n²) 拼接 |
-| `include/http/HttpResponse.h` | 新增 `k302Found` 状态码、`addHeader()` |
-| `include/http/HttpServer.h` | 新增 `setAutoClose()` / `scheduleIdleClose()` |
-| `common/http/HttpServer.cpp` | 空闲超时递归调度定时器（weak_ptr 防野指针） |
-| `common/http/HttpContext.cpp` | body 解析改用 `appendBody()` |
-| `include/log/Logger.h` | 新增 `LOG_FATAL` 宏 |
-| `test/BenchmarkTest.cpp` | 多线程 HTTP 内置压测工具 |
-| `static/index.html` | 首页 HTML |
-| `static/login.html` | 登录表单页 |
-| `static/fileserver.html` | 文件管理页模板 |
-| `files/readme.txt` / `files/scores.csv` | 示例文件 |
+| `http_server.cpp` | 启动时预加载静态文件到内存缓存 (`g_staticCache`)，消除请求热路径磁盘 I/O |
+| `include/Connection.h` | 新增 `send(std::string&&)` 移动重载 |
+| `common/Connection.cpp` | 实现 send 移动语义：直写路径零拷贝 |
+| `include/http/HttpContext.h` | 新增 `bodyLen_` 成员缓存 Content-Length |
+| `common/http/HttpContext.cpp` | Content-Length 仅查找一次并缓存，消除热路径哈希查找 |
+| `common/Socket.cpp` | 所有操作增加 `errno` + `strerror` 诊断日志 |
+| `common/Poller/kqueue/KqueuePoller.cpp` | kevent 错误日志增强 |
+| `test/StressTest.cpp` | 统计数据增加最大/最小延迟 |
 
 ## 构建 & 运行
 
 ```bash
-cd HISTORY/day26
+cd HISTORY/day27
 cmake -S . -B build && cmake --build build -j4
 
-# HTTP 文件服务器
+# 启动服务器
 ./build/http_server
-# 浏览器访问 http://127.0.0.1:8888/
 
-# HTTP 压测
+# 压测（对比 day26 QPS）
 ./build/BenchmarkTest 127.0.0.1 8888 / 4 10
 ```
 
@@ -39,7 +32,7 @@ cmake -S . -B build && cmake --build build -j4
 
 | 名称 | 说明 |
 |------|------|
-| `http_server` | HTTP 文件服务器（上传/下载/登录/首页） |
+| `http_server` | HTTP 文件服务器（带静态缓存） |
 | `server` | Echo TCP 服务器 |
 | `client` | TCP 客户端 |
 | `BenchmarkTest` | 多线程 HTTP 压测工具 |
@@ -48,22 +41,11 @@ cmake -S . -B build && cmake --build build -j4
 | `ThreadPoolTest` | 线程池测试 |
 | `StressTest` | 压力测试客户端 |
 
-## HTTP 路由
+## 核心优化
 
-| 方法 | 路径 | 响应 |
-|------|------|------|
-| GET | `/` | 首页 (index.html) |
-| GET | `/login.html` | 登录表单 |
-| GET | `/fileserver` | 文件列表页（动态生成） |
-| GET | `/download/<name>` | 文件下载 (Content-Disposition) |
-| GET | `/delete/<name>` | 删除文件后重定向 |
-| POST | `/login` | 表单解析 → 重定向 |
-| POST | `/upload` | multipart/form-data 文件上传 |
-| 其他 | 任意 | 404 Not Found |
-
-## 核心设计
-
-- **空闲超时**：`alive_` (shared_ptr<bool>) + weak_ptr 防止定时器回调访问已析构的 Connection
-- **递归调度**：超时未触发时自动续期，触发时关闭连接
-- **文件安全**：`isSafeFilename()` 阻止路径遍历（`..`、`/`、`\0`）
-- **appendBody()**：O(1) 均摊追加替代 O(n²) 的 setBody(body()+...)
+| 优化 | 效果 |
+|------|------|
+| `g_staticCache` 预加载 | 请求热路径零磁盘 I/O，QPS +15-20% |
+| `send(string&&)` | 小响应直写路径零拷贝，避免 OutputBuffer 中转 |
+| `bodyLen_` 缓存 | 大文件分段上传消除重复 unordered_map 查找 |
+| Socket 诊断 | errno + strerror 详细日志，快速定位网络故障 |

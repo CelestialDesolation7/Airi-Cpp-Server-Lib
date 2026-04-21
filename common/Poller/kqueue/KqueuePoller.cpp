@@ -73,7 +73,7 @@ std::vector<Channel *> KqueuePoller::poll(int timeout) {
     struct timespec *pts = nullptr;
     if (timeout >= 0) {
         ts.tv_sec = timeout / 1000;
-        ts.tv_nsec = (long)(timeout % 1000) * 1000000;
+        ts.tv_nsec = static_cast<long>(timeout % 1000) * 1000000;
         pts = &ts;
     }
     int nfds = kevent(kqueueFd_, nullptr, 0, events_.data(), MAX_EVENTS, pts);

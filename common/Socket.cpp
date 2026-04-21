@@ -20,19 +20,22 @@ Socket::~Socket() {
 }
 
 void Socket::bind(InetAddress *addr) {
-    ErrIf(::bind(fd_, (sockaddr *)&addr->addr, addr->addr_len) == -1, "socket bind error");
+    ErrIf(::bind(fd_, reinterpret_cast<sockaddr *>(&addr->addr), addr->addr_len) == -1,
+          "socket bind error");
 }
 
 void Socket::listen() { ErrIf(::listen(fd_, SOMAXCONN), "socket listen error"); }
 
 int Socket::accept(InetAddress *addr) {
-    int client_sockfd = ::accept(fd_, (sockaddr *)&addr->addr, &addr->addr_len);
+    int client_sockfd =
+        ::accept(fd_, reinterpret_cast<sockaddr *>(&addr->addr), &addr->addr_len);
     ErrIf(client_sockfd == -1, "socket accept error");
     return client_sockfd;
 }
 
 void Socket::connect(InetAddress *addr) {
-    ErrIf(::connect(fd_, (sockaddr *)&addr->addr, addr->addr_len) == -1, "socket connect error");
+    ErrIf(::connect(fd_, reinterpret_cast<sockaddr *>(&addr->addr), addr->addr_len) == -1,
+          "socket connect error");
 }
 
 int Socket::getFd() { return fd_; }

@@ -26,6 +26,9 @@ class Connection {
     ~Connection();
 
     void send(const std::string &msg);
+    // 移动重载：当调用方持有临时字符串（如 resp.serialize() 的返回值）时，
+    // 避免一次额外的字符串拷贝。热路径：HttpServer::onRequest() → conn->send(resp.serialize())
+    void send(std::string &&msg);
 
     void setOnMessageCallback(std::function<void(Connection *)> const &cb);
     // deleteCallback 改为 void(int fd)

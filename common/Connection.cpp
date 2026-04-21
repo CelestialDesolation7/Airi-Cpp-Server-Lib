@@ -82,6 +82,11 @@ void Connection::doWrite() {
     }
 }
 
+// ── 发送数据：先尝试直接 write，写不完再追加到 OutputBuffer ──────────────────
+// 优先路径（loopback 小响应）：OutputBuffer 为空 + socket 可写 →
+//   直接 write(fd, ...) 一次写完，不经过 OutputBuffer，零额外拷贝。
+// 降级路径（大响应 / 写缓冲满）：剩余数据追加到 OutputBuffer，
+//   注册 EPOLLOUT / EVFILT_WRITE，等内核通知后由 doWrite() 续写。
 void Connection::send(const std::string &msg) {
     if (msg.empty())
         return;
@@ -90,25 +95,53 @@ void Connection::send(const std::string &msg) {
     size_t remaining = msg.size();
     bool faultError = false;
 
-    // 1. 如果当前没有正在等待写的（OutputBuffer 为空），且 socket 可写
-    // 尝试直接 write，减少一次 buffer copy
     if (!channel_->isWriting() && outputBuffer_.readableBytes() == 0) {
         nwrote = ::write(sock_->getFd(), msg.data(), msg.size());
         if (nwrote >= 0) {
             remaining = msg.size() - nwrote;
         } else {
             nwrote = 0;
-            //
             if ((errno != EWOULDBLOCK) && (errno == EPIPE || errno == ECONNRESET)) {
                 faultError = true;
             }
         }
     }
 
-    // 2. 如果刚才没写完（或者 OutputBuffer 本来就有积压），把剩下的追加到 OutputBuffer
-    // 并注册写事件，等待内核通知
     if (!faultError && remaining > 0) {
         outputBuffer_.append(msg.data() + nwrote, remaining);
+        if (!channel_->isWriting()) {
+            channel_->enableWriting();
+        }
+    }
+}
+
+// 移动重载：对 conn->send(resp.serialize()) 这类调用，
+// serialize() 返回的临时字符串直接被移入，避免在 "零拷贝写路径" 上额外复制。
+// 若需要 fallback 到 OutputBuffer，仍然 append（字节级拷贝无法避免）。
+void Connection::send(std::string &&msg) {
+    if (msg.empty())
+        return;
+
+    ssize_t nwrote = 0;
+    size_t sz = msg.size();
+    bool faultError = false;
+
+    if (!channel_->isWriting() && outputBuffer_.readableBytes() == 0) {
+        nwrote = ::write(sock_->getFd(), msg.data(), sz);
+        if (nwrote >= 0) {
+            // 全部写完：msg 直接废弃，无任何拷贝
+            if (static_cast<size_t>(nwrote) == sz)
+                return;
+        } else {
+            nwrote = 0;
+            if ((errno != EWOULDBLOCK) && (errno == EPIPE || errno == ECONNRESET)) {
+                faultError = true;
+            }
+        }
+    }
+
+    if (!faultError && static_cast<size_t>(nwrote) < sz) {
+        outputBuffer_.append(msg.data() + nwrote, sz - nwrote);
         if (!channel_->isWriting()) {
             channel_->enableWriting();
         }

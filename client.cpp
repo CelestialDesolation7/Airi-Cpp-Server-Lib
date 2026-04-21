@@ -24,7 +24,8 @@ int main() {
     server_addr.sin_port = htons(8888);
     // 对应server那边的地址
 
-    ErrIf(connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1,
+    ErrIf(connect(sockfd, reinterpret_cast<struct sockaddr *>(&server_addr), sizeof(server_addr)) ==
+              -1,
           "[客户端] 与server建立连接时失败\n");
 
     std::cout << "[客户端] 成功与server建立TCP连接\n";

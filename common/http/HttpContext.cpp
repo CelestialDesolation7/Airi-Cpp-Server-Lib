@@ -9,6 +9,7 @@ void HttpContext::reset() {
     request_.reset();
     tokenBuf_.clear();
     colonBuf_.clear();
+    bodyLen_ = 0;
 }
 
 // ── 有限状态机核心 ──────────────────────────────────────────────────────────
@@ -167,8 +168,11 @@ bool HttpContext::parse(const char *data, int len) {
                     ++p; // 跳过 '\r'
                     // 消耗空行的 '\n'，确保 p 指向 body 的第一个字节
                     if (p < end && *p == '\n') ++p;
-                    std::string cl = request_.header("Content-Length");
-                    if (!cl.empty() && std::atoi(cl.c_str()) > 0) {
+                    // 性能优化：Content-Length 只在此处查找一次并缓存到 bodyLen_，
+                    // 后续 kBody 重入时直接使用成员变量，无需再查 unordered_map
+                    const std::string &cl = request_.header("Content-Length");
+                    bodyLen_ = cl.empty() ? 0 : std::atoi(cl.c_str());
+                    if (bodyLen_ > 0) {
                         state_ = State::kBody;
                     } else {
                         state_ = State::kComplete;
@@ -206,19 +210,18 @@ bool HttpContext::parse(const char *data, int len) {
         //   旧代码：每次调用都生成全量 string 副本，138KB 文件 ≈ 9 次 × 平均 70KB = 630KB 无效分配
         //   新代码：body_.append() 直接扩容，均摊 O(1)
         case State::kBody: {
-            // Content-Length 只需从 headers map 读取一次；bodyLen 在每次重入时重新计算但不昂贵
-            const std::string &cl = request_.header("Content-Length");
-            int bodyLen = cl.empty() ? 0 : std::atoi(cl.c_str());
+            // bodyLen_ 已在 headers 解析完成时缓存（见 kHeaderKey 空行分支），
+            // 无需再次查 unordered_map，消除热路径上的哈希查找开销
             int alreadyRead = static_cast<int>(request_.body().size());
             int remaining = static_cast<int>(end - p);
-            int toRead = std::min(bodyLen - alreadyRead, remaining);
+            int toRead = std::min(bodyLen_ - alreadyRead, remaining);
             if (toRead > 0) {
                 request_.appendBody(p, toRead); // O(1) 均摊，无副本
                 p += toRead;
             } else {
                 goto done; // 当前 TCP 段已读尽，等待下次 parse() 调用
             }
-            if (static_cast<int>(request_.body().size()) >= bodyLen) {
+            if (static_cast<int>(request_.body().size()) >= bodyLen_) {
                 state_ = State::kComplete;
             }
             continue; // 已手动推进 p，跳过末尾的 ++p

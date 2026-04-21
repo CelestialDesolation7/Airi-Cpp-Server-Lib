@@ -158,7 +158,7 @@ int main(int argc, char *argv[]) {
         setNonBlocking(fd);
 
         // 发起非阻塞连接（通常立即返回 -1 / EINPROGRESS）
-        connect(fd, (sockaddr *)&ctx->addr->addr, ctx->addr->addr_len);
+        connect(fd, reinterpret_cast<sockaddr *>(&ctx->addr->addr), ctx->addr->addr_len);
 
         // 监听 WRITE 事件：连接建立完成时 socket 会变为可写
         pollRegisterWrite(fd, ctx);

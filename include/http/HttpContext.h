@@ -60,5 +60,9 @@ class HttpContext {
     std::string tokenBuf_;  // 当前正在积累的 token（方法名/URL/头字段名/值等）
     std::string colonBuf_;  // 冒号左侧（头字段名 / query key）
 
+    // 性能优化：在 headers 结束时一次性读取 Content-Length 并缓存，
+    // 避免 kBody 状态每次重入时都做 unordered_map 查找（对大文件分段上传效果明显）
+    int bodyLen_{0};
+
     void saveToken(const std::string &tok);  // 根据当前状态提交 token
 };
