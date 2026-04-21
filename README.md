@@ -1,15 +1,24 @@
-# Day 03：IO 多路复用 + 非阻塞 IO
+# Day 04：面向对象封装
 
-使用 epoll（Linux）/ kqueue（macOS）实现多客户端并发 echo 服务器。
+将裸系统调用封装为 Socket、InetAddress、Epoll 三个 C++ 类。
 
 ## 文件结构
 
 ```
-day03/
+day04/
 ├── CMakeLists.txt
-├── server.cpp      ← 多路复用 echo 服务器（边缘触发 + 非阻塞）
-├── client.cpp      ← 交互客户端（fgets 安全输入）
-├── util.h / util.cpp
+├── server.cpp
+├── client.cpp
+├── include/
+│   ├── Epoll.h        ← 跨平台 IO 多路复用封装
+│   ├── InetAddress.h   ← sockaddr_in 封装
+│   ├── Socket.h        ← RAII socket fd 封装
+│   └── util.h
+├── common/
+│   ├── Epoll.cpp
+│   ├── InetAddress.cpp
+│   ├── Socket.cpp
+│   └── util.cpp
 └── README.md
 ```
 
@@ -23,11 +32,8 @@ cmake --build build
 ## 运行
 
 ```bash
-# 终端 1：启动服务器
-./build/server
-
-# 终端 2, 3, ...：分别启动客户端
-./build/client
+./build/server    # 终端 1
+./build/client    # 终端 2
 ```
 
-可以同时开多个客户端终端，服务器支持并发处理。输入文字回车后服务器回显。
+功能同 Day 03（多客户端 echo），但代码结构更清晰。
