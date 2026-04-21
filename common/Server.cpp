@@ -3,12 +3,16 @@
 #include "Connection.h"
 #include "InetAddress.h"
 #include "Socket.h"
+#include "ThreadPool.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <string>
+#include <thread>
 
 #define READ_BUFFER 1024
 
@@ -18,9 +22,14 @@ Server::Server(Eventloop *_loop) : loop(_loop) {
     std::function<void(Socket *, InetAddress *)> cb =
         std::bind(&Server::newConnection, this, std::placeholders::_1, std::placeholders::_2);
     acceptor->setNewConnectionCallback(cb);
+    threadPool = new ThreadPool();
+    std::cout << "[server] ThreadPool initialized" << std::endl;
 }
 
-Server::~Server() { delete acceptor; }
+Server::~Server() {
+    delete acceptor;
+    delete threadPool;
+}
 
 // 这个函数就是以前 accept 之后的那部分逻辑
 void Server::newConnection(Socket *client_sock, InetAddress *client_addr) {
@@ -31,9 +40,28 @@ void Server::newConnection(Socket *client_sock, InetAddress *client_addr) {
 
     Connection *conn = new Connection(loop, client_sock);
 
-    std::function<void(Socket *)> cb =
+    // 定义一个 lambda 表达式，捕获 this （Server类指针）拿到ThreadPool
+    // 定义 Server socket 的业务逻辑：
+    // 把业务函数写在这里，作为一个Task加入线程池
+    std::function<void(Connection *)> msgCb = [this](Connection *c) {
+        // 这里的 lambda 是为了捕获 this (Server) 拿到 threadPool
+        // 把具体的业务 (Echo) 作为一个 Task 添加到线程池
+        // 注意：这里有严重的线程不安全！c->readBuffer 在主线程写，子线程读
+        // 后面会修
+
+        threadPool->add([c]() {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::string msg = c->readBuffer()->retrieveAllAsString();
+            std::cout << "Thread " << std::this_thread::get_id() << " recieve: " << msg
+                      << std::endl;
+            c->send(msg);
+        });
+    };
+    conn->setOnMessageCallback(msgCb);
+
+    std::function<void(Socket *)> deleteCb =
         std::bind(&Server::deleteConnection, this, std::placeholders::_1);
-    conn->setDeleteConnectionCallback(cb);
+    conn->setDeleteConnectionCallback(deleteCb);
 
     connection[client_sock->getFd()] = conn;
 

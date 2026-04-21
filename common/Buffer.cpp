@@ -29,13 +29,9 @@ void Buffer::retrieve(size_t len) {
     if (len < readableBytes()) {
         readerIndex_ += len;
     } else {
-        retrieveAll();
+        readerIndex_ = kCheapPrepand;
+        writerIndex_ = kCheapPrepand;
     }
-}
-
-void Buffer::retrieveAll() {
-    readerIndex_ = kCheapPrepand;
-    writerIndex_ = kCheapPrepand;
 }
 
 void Buffer::append(const char *data, size_t len) {

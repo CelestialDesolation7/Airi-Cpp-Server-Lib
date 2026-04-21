@@ -34,13 +34,9 @@ void Connection::handleRead() {
 
     if (n > 0) {
         // 读到了数据，业务逻辑处理
-        // 现在的业务是 Echo，所以直接把 buf 里的拿出来发回去
-        // 实际应该是: onMessageCallback(this, &inputBuffer_);
-
-        std::string msg = inputBuffer_.retrieveAllAsString();
-        std::cout << "[server] message from client fd " << sockfd << ": " << msg << std::endl;
-        // 这一行就是业务逻辑，要更复杂的业务逻辑就换掉这里
-        send(msg);
+        // 不再硬编码 Echo 业务
+        if (onMessageCallback)
+            onMessageCallback(this);
     } else if (n == 0) {
         std::cout << "[server] client fd " << sockfd << " disconnected." << std::endl;
         // 关键：连接断开时，通过回调通知 Server 移除自己
@@ -57,8 +53,11 @@ void Connection::handleRead() {
 void Connection::handleWrite() {
     if (channel->isWriting()) {
         ssize_t n = ::write(sock->getFd(), outputBuffer_.peek(), outputBuffer_.readableBytes());
+        // 不一定能一次全发出去
         if (n > 0) {
+            // 一部分数据已被输出，对应 Buffer 区域被划入废弃区域
             outputBuffer_.retrieve(n);
+            // 如果全发完了，通知 epoll 本 channel 不再需要发数据
             if (outputBuffer_.readableBytes() == 0) {
                 channel->disableWriting();
             }
@@ -102,3 +101,11 @@ void Connection::send(const std::string &msg) {
 void Connection::setDeleteConnectionCallback(std::function<void(Socket *)> _cb) {
     deleteConnectionCallback = _cb;
 }
+
+void Connection::setOnMessageCallback(std::function<void(Connection *)> const &_cb) {
+    onMessageCallback = _cb;
+}
+
+Buffer *Connection::readBuffer() { return &inputBuffer_; }
+
+Buffer *Connection::outBuffer() { return &outputBuffer_; }
