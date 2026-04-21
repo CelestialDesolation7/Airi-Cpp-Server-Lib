@@ -15,3 +15,14 @@
     DISALLOW_MOVE(cname);
 
 #define ASSERT(expr, message) assert((expr) && (message))
+
+// 函数返回码，替代裸 void 或 bool 返回
+enum RC {
+    RC_UNDEFINED,
+    RC_SUCCESS,
+    RC_SOCKET_ERROR,
+    RC_POLLER_ERROR,
+    RC_CONNECTION_ERROR,
+    RC_ACCEPTOR_ERROR,
+    RC_UNIMPLEMENTED
+};

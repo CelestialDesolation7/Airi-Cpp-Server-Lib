@@ -1,11 +1,12 @@
 #pragma once
 #include "Buffer.h"
+#include "Channel.h"
 #include "Macros.h"
+#include "Socket.h"
 #include <functional>
+#include <memory>
 
 class Eventloop;
-class Socket;
-class Channel;
 class Buffer;
 
 class Connection {
@@ -18,13 +19,15 @@ class Connection {
         kFailed,
     };
 
-    Connection(Eventloop *_loop, Socket *_sock);
+    // 构造参数改为 int fd，Socket 在内部创建
+    Connection(int fd, Eventloop *loop);
     ~Connection();
 
     void send(const std::string &msg);
 
     void setOnMessageCallback(std::function<void(Connection *)> const &cb);
-    void setDeleteConnectionCallback(std::function<void(Socket *)> _cb);
+    // deleteCallback 改为 void(int fd)
+    void setDeleteConnectionCallback(std::function<void(int)> _cb);
     void setOnConnectCallback(std::function<void(Connection *)> const &_cb);
 
     void close();
@@ -36,20 +39,18 @@ class Connection {
 
     Socket *getSocket();
     State getState() const;
-    const char *readBuffer();
-    const char *outBuffer();
     Buffer *getInputBuffer();
     Buffer *getOutputBuffer();
 
   private:
     State state_{State::kInvalid};
     Eventloop *loop_;
-    Socket *sock_;
-    Channel *channel_;
+    std::unique_ptr<Socket> sock_;
+    std::unique_ptr<Channel> channel_;
     Buffer inputBuffer_;
     Buffer outputBuffer_;
 
-    std::function<void(Socket *)> deleteConnectionCallback_;
+    std::function<void(int)> deleteConnectionCallback_;
     // 业务处理回调，当 Buffer 有数据时被调用
     std::function<void(Connection *)> onConnectCallback_;
     std::function<void(Connection *)> onMessageCallback_;

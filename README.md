@@ -1,10 +1,11 @@
-# Day 18 — Poller 策略模式拆分 + Airi-Cpp-Server-Lib 伞形头文件
+# Day 19 — Server → TcpServer 重命名 + 智能指针改造
 
 ## 核心变更
-- **Poller 拆分为策略模式**：抽象基类 `Poller` + `EpollPoller`（Linux）+ `KqueuePoller`（macOS）+ `DefaultPoller.cpp` 工厂
-- **新增 `Airi-Cpp-Server-Lib.h`** 伞形头文件
-- **`Macros.h`** 移除自定义 `OS_LINUX/OS_MACOS`，改用编译器预定义 `__linux__` / `__APPLE__`
-- **`Eventloop`** 改用 `Poller::newDefaultPoller(this)` 工厂创建
+- **`Server` → `TcpServer`** 重命名，语义更精确
+- **全面 `unique_ptr`**：TcpServer、Acceptor、Connection 内部资源均用智能指针管理
+- **接口简化**：Acceptor 回调从 `void(Socket*, InetAddress*)` 改为 `void(int fd)`；Connection 构造从 `(Eventloop*, Socket*)` 改为 `(int fd, Eventloop*)`
+- **新增 `RC` 返回码枚举**（Macros.h），为后续错误处理改造铺路
+- **`TcpServer::Start()`**：自包含启动方法，内部自建 mainReactor
 
 ## 构建
 
@@ -20,17 +21,16 @@ cmake --build build -j4
 ```
 ├── server.cpp / client.cpp         入口
 ├── include/
-│   ├── Poller/
-│   │   ├── Poller.h                抽象基类 + 工厂方法
-│   │   ├── EpollPoller.h           Linux epoll 实现
-│   │   └── KqueuePoller.h          macOS kqueue 实现
-│   ├── Airi-Cpp-Server-Lib.h            伞形头文件（新增）
+│   ├── TcpServer.h                 替代 Server.h（新增）
+│   ├── Connection.h                unique_ptr 成员 + int fd 构造
+│   ├── Acceptor.h                  unique_ptr 成员 + void(int) 回调
+│   ├── Poller/                     策略模式（同 Day 18）
+│   ├── Airi-Cpp-Server-Lib.h            伞形头文件（含 TcpServer.h）
 │   └── ...
 ├── common/
-│   ├── Poller/
-│   │   ├── DefaultPoller.cpp       工厂：按平台创建具体 Poller
-│   │   ├── epoll/EpollPoller.cpp   epoll 实现
-│   │   └── kqueue/KqueuePoller.cpp kqueue 实现
-│   └── ...
+│   ├── TcpServer.cpp               替代 Server.cpp（新增）
+│   ├── Connection.cpp              make_unique 创建 Socket/Channel
+│   ├── Acceptor.cpp                简化回调，只传 fd
+│   └── Poller/                     同 Day 18
 └── test/                           ThreadPoolTest / StressTest
 ```

@@ -14,9 +14,9 @@
 
 #define READ_BUFFER 1024
 
-Connection::Connection(Eventloop *_loop, Socket *_sock)
-    : loop_(_loop), sock_(_sock), channel_(nullptr) {
-    channel_ = new Channel(loop_, sock_->getFd());
+Connection::Connection(int fd, Eventloop *loop)
+    : loop_(loop), sock_(std::make_unique<Socket>(fd)), channel_(nullptr) {
+    channel_ = std::make_unique<Channel>(loop_, sock_->getFd());
     channel_->setReadCallback(std::bind(&Connection::doRead, this));
     channel_->setWriteCallback(std::bind(&Connection::doWrite, this));
     channel_->enableReading();
@@ -24,10 +24,7 @@ Connection::Connection(Eventloop *_loop, Socket *_sock)
     state_ = State::kConnected;
 }
 
-Connection::~Connection() {
-    delete channel_;
-    delete sock_;
-}
+Connection::~Connection() {}
 
 void Connection::doRead() {
     int sockfd = sock_->getFd();
@@ -50,13 +47,6 @@ void Connection::doRead() {
     // 若 n > 0，数据已被读入 inputBuffer
     // 此函数返回后指令流将转移到 Business() 中调用 onMessageCallback_ 的地方
     // 在那里执行业务逻辑
-}
-
-Connection::State Connection::getState() const { return state_; }
-
-void Connection::close() {
-    if (deleteConnectionCallback_)
-        deleteConnectionCallback_(sock_);
 }
 
 void Connection::doWrite() {
@@ -113,8 +103,25 @@ void Connection::Business() {
         onMessageCallback_(this);
 }
 
-void Connection::setDeleteConnectionCallback(std::function<void(Socket *)> _cb) {
-    deleteConnectionCallback_ = _cb;
+void Connection::Read() { doRead(); }
+
+void Connection::Write() { doWrite(); }
+
+void Connection::close() {
+    if (deleteConnectionCallback_)
+        deleteConnectionCallback_(sock_->getFd()); // 传 fd 不传指针
+}
+
+Connection::State Connection::getState() const { return state_; }
+
+Socket *Connection::getSocket() { return sock_.get(); }
+
+Buffer *Connection::getInputBuffer() { return &inputBuffer_; }
+
+Buffer *Connection::getOutputBuffer() { return &outputBuffer_; };
+
+void Connection::setDeleteConnectionCallback(std::function<void(int)> cb) {
+    deleteConnectionCallback_ = std::move(cb);
 }
 
 void Connection::setOnConnectCallback(std::function<void(Connection *)> const &_cb) {
@@ -125,17 +132,3 @@ void Connection::setOnMessageCallback(std::function<void(Connection *)> const &c
     onMessageCallback_ = cb;
     channel_->setReadCallback(std::bind(&Connection::Business, this));
 }
-
-const char *Connection::readBuffer() { return inputBuffer_.peek(); }
-
-const char *Connection::outBuffer() { return outputBuffer_.peek(); }
-
-Socket *Connection::getSocket() { return sock_; }
-
-Buffer *Connection::getInputBuffer() { return &inputBuffer_; }
-
-Buffer *Connection::getOutputBuffer() { return &outputBuffer_; };
-
-void Connection::Read() { doRead(); }
-
-void Connection::Write() { doWrite(); }

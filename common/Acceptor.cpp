@@ -3,56 +3,40 @@
 #include "InetAddress.h"
 #include "Socket.h"
 #include "util.h"
-#include <cstdio>
+#include <fcntl.h>
 #include <functional>
 #include <sys/socket.h>
 
-Acceptor::Acceptor(Eventloop *_loop)
-    : loop_(_loop), sock_(nullptr), addr_(nullptr), acceptChannel_(nullptr) {
-    sock_ = new Socket();
-    addr_ = new InetAddress("127.0.0.1", 8888);
+Acceptor::Acceptor(Eventloop *loop) {
+    sock_ = std::make_unique<Socket>();
+    InetAddress addr("127.0.0.1", 8888);
     int opt = 1;
     ErrIf(setsockopt(sock_->getFd(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)),
-          "[server] set sock failed.");
-    sock_->bind(addr_);
+          "[server] setsockopt failed.");
+    sock_->bind(&addr);
     sock_->listen();
     sock_->setnonblocking();
 
-    acceptChannel_ = new Channel(loop_, sock_->getFd());
-
+    acceptChannel_ = std::make_unique<Channel>(loop, sock_->getFd());
     // 只要有新连接请求，Channel 就会调用我们注册的 acceptConnection
-    std::function<void()> cb = std::bind(&Acceptor::acceptConnection, this);
-    acceptChannel_->setReadCallback(cb);
-    acceptChannel_->enableReading();
+    acceptChannel_->setReadCallback(std::bind(&Acceptor::acceptConnection, this));
     // 注意：Acceptor 不使用 ET 模式，避免多个连接同时到达时只 accept 一次导致丢连接
+    acceptChannel_->enableReading();
 }
 
-Acceptor::~Acceptor() {
-    delete sock_;
-    delete addr_;
-    delete acceptChannel_;
-}
+Acceptor::~Acceptor() {}
 
 void Acceptor::acceptConnection() {
-    InetAddress *client_addr = new InetAddress();
-    int client_fd = sock_->accept(client_addr);
-
-    if (client_fd == -1) {
-        delete client_addr;
+    InetAddress clientAddr;
+    int clientFd = sock_->accept(&clientAddr);
+    if (clientFd == -1)
         return;
-    }
-
-    Socket *client_sock = new Socket(client_fd);
-    client_sock->setnonblocking();
-
-    if (newConnectionCallback_) {
-        newConnectionCallback_(client_sock, client_addr);
-    } else {
-        delete client_addr;
-        delete client_sock;
-    }
+    // 直接 fcntl，不通过 Socket 包装（避免析构时 close）
+    fcntl(clientFd, F_SETFL, fcntl(clientFd, F_GETFL) | O_NONBLOCK);
+    if (newConnectionCallback_)
+        newConnectionCallback_(clientFd);
 }
 
-void Acceptor::setNewConnectionCallback(std::function<void(Socket *, InetAddress *)> _cb) {
-    newConnectionCallback_ = _cb;
+void Acceptor::setNewConnectionCallback(std::function<void(int)> cb) {
+    newConnectionCallback_ = std::move(cb);
 }
