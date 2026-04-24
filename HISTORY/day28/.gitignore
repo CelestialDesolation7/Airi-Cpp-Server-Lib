@@ -1,0 +1,31 @@
+# 构建产物
+build/
+build-*/
+cmake-build-*/
+
+# CMake 安装/导出生成物（不应纳入版本控制）
+*Config.cmake
+*ConfigVersion.cmake
+*Targets.cmake
+*Targets-*.cmake
+install_manifest.txt
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+
+# 编辑器/系统
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# 应用层生成物
+app_example/build/
+app_example/external/Airi-Cpp-Server-Lib/lib/cmake/
+
+# 日志/运行时
+*.log
+logs/
+core

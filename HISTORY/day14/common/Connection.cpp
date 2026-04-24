@@ -1,0 +1,112 @@
+#include "Connection.h"
+#include "Buffer.h"
+#include "Channel.h"
+#include "Socket.h"
+
+#include <cerrno>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define READ_BUFFER 1024
+
+Connection::Connection(Eventloop *_loop, Socket *_sock)
+    : loop_(_loop), sock_(_sock), channel_(nullptr) {
+    channel_ = new Channel(loop_, sock_->getFd());
+    channel_->setReadCallback(std::bind(&Connection::handleRead, this));
+    channel_->setWriteCallback(std::bind(&Connection::handleWrite, this));
+    channel_->enableReading();
+    channel_->enableET();
+}
+
+Connection::~Connection() {
+    delete channel_;
+    delete sock_;
+}
+
+void Connection::handleRead() {
+    int sockfd = sock_->getFd();
+    int savedErrno = 0;
+    ssize_t n = inputBuffer_.readFd(sockfd, &savedErrno);
+
+    if (n > 0) {
+        // 读到了数据，业务逻辑处理
+        // 不再硬编码 Echo 业务
+        if (onMessageCallback_)
+            onMessageCallback_(this);
+    } else if (n == 0) {
+        std::cout << "[server] client fd " << sockfd << " disconnected." << std::endl;
+        // 关键：连接断开时，通过回调通知 Server 移除自己
+        if (deleteConnectionCallback_)
+            deleteConnectionCallback_(sock_);
+    } else {
+        std::cerr << "[server] read error on fd " << sockfd << ": " << strerror(savedErrno)
+                  << std::endl;
+        if (deleteConnectionCallback_)
+            deleteConnectionCallback_(sock_);
+    }
+}
+
+void Connection::handleWrite() {
+    if (channel_->isWriting()) {
+        ssize_t n = ::write(sock_->getFd(), outputBuffer_.peek(), outputBuffer_.readableBytes());
+        // 不一定能一次全发出去
+        if (n > 0) {
+            // 一部分数据已被输出，对应 Buffer 区域被划入废弃区域
+            outputBuffer_.retrieve(n);
+            // 如果全发完了，通知 epoll 本 channel 不再需要发数据
+            if (outputBuffer_.readableBytes() == 0) {
+                channel_->disableWriting();
+            }
+        }
+    }
+}
+
+void Connection::send(const std::string &msg) {
+    if (msg.empty())
+        return;
+
+    ssize_t nwrote = 0;
+    size_t remaining = msg.size();
+    bool faultError = false;
+
+    // 1. 如果当前没有正在等待写的（OutputBuffer 为空），且 socket 可写
+    // 尝试直接 write，减少一次 buffer copy
+    if (!channel_->isWriting() && outputBuffer_.readableBytes() == 0) {
+        nwrote = ::write(sock_->getFd(), msg.data(), msg.size());
+        if (nwrote >= 0) {
+            remaining = msg.size() - nwrote;
+        } else {
+            nwrote = 0;
+            //
+            if ((errno != EWOULDBLOCK) && (errno == EPIPE || errno == ECONNRESET)) {
+                faultError = true;
+            }
+        }
+    }
+
+    // 2. 如果刚才没写完（或者 OutputBuffer 本来就有积压），把剩下的追加到 OutputBuffer
+    // 并注册写事件，等待内核通知
+    if (!faultError && remaining > 0) {
+        outputBuffer_.append(msg.data() + nwrote, remaining);
+        if (!channel_->isWriting()) {
+            channel_->enableWriting();
+        }
+    }
+}
+
+void Connection::setDeleteConnectionCallback(std::function<void(Socket *)> _cb) {
+    deleteConnectionCallback_ = _cb;
+}
+
+void Connection::setOnMessageCallback(std::function<void(Connection *)> const &_cb) {
+    onMessageCallback_ = _cb;
+}
+
+Buffer *Connection::readBuffer() { return &inputBuffer_; }
+
+Buffer *Connection::outBuffer() { return &outputBuffer_; }
