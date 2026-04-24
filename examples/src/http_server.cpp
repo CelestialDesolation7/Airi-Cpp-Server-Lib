@@ -44,18 +44,21 @@
 #include <http/RateLimiter.h>
 #include <http/ServerMetrics.h>
 #include <http/StaticFileHandler.h>
+#include <log/AsyncLogging.h>
 #include <log/Logger.h>
 #include <net/SignalHandler.h>
 
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 
 // ── 配置 ──────────────────────────────────────────────────────────────────────
 namespace {
@@ -85,9 +88,7 @@ static void handleIndex(const HttpRequest &, HttpResponse *resp) {
     static std::string cached;
     static std::once_flag once;
     static bool ok = false;
-    std::call_once(once, [] {
-        ok = readFile(std::string(kStaticDir) + "/index.html", &cached);
-    });
+    std::call_once(once, [] { ok = readFile(std::string(kStaticDir) + "/index.html", &cached); });
     if (!ok) {
         resp->setStatus(HttpResponse::StatusCode::k500InternalServerError, "Internal Server Error");
         resp->setContentType("text/plain; charset=utf-8");
@@ -126,6 +127,143 @@ static void handleMetrics(const HttpRequest &, HttpResponse *resp) {
     resp->setBody(ServerMetrics::instance().toPrometheus());
 }
 
+// ── 文件管理 API（/api/files）─────────────────────────────────────────────────
+//   GET    /api/files            → JSON 列出 ./files 下所有文件 [{name,size,mtime}]
+//   POST   /api/files            → multipart/form-data 上传单文件，写入 ./files
+//   DELETE /api/files/<name>     → 删除指定文件
+// 路径穿越防护：拒绝含 '/'、'..' 或以 '.' 开头的文件名。
+static bool isSafeFilename(const std::string &name) {
+    if (name.empty() || name.size() > 200)
+        return false;
+    if (name[0] == '.')
+        return false;
+    return name.find('/') == std::string::npos && name.find("..") == std::string::npos;
+}
+
+static std::string jsonEscape(const std::string &s) {
+    std::string r;
+    r.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+        case '"':  r += "\\\""; break;
+        case '\\': r += "\\\\"; break;
+        case '\n': r += "\\n";  break;
+        case '\r': r += "\\r";  break;
+        case '\t': r += "\\t";  break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                r += buf;
+            } else {
+                r += c;
+            }
+        }
+    }
+    return r;
+}
+
+static void handleApiFilesList(const HttpRequest &, HttpResponse *resp) {
+    DIR *dir = opendir(kFilesDir);
+    std::string body = "[";
+    bool first = true;
+    if (dir) {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            std::string name(ent->d_name);
+            if (name == "." || name == "..")
+                continue;
+            std::string path = std::string(kFilesDir) + "/" + name;
+            struct stat st{};
+            if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+                continue;
+            if (!first) body += ',';
+            first = false;
+            body += "{\"name\":\"" + jsonEscape(name) +
+                    "\",\"size\":" + std::to_string(st.st_size) +
+                    ",\"mtime\":" + std::to_string(st.st_mtime) + "}";
+        }
+        closedir(dir);
+    }
+    body += "]";
+    resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
+    resp->setContentType("application/json");
+    resp->setBody(body);
+}
+
+static void handleApiFilesUpload(const HttpRequest &req, HttpResponse *resp) {
+    HttpRequest::MultipartFile file;
+    if (!req.parseMultipart(file) || file.filename.empty()) {
+        resp->setStatus(HttpResponse::StatusCode::k400BadRequest, "Bad Request");
+        resp->setContentType("application/json");
+        resp->setBody(R"({"error":"invalid multipart body"})");
+        return;
+    }
+    if (!isSafeFilename(file.filename)) {
+        resp->setStatus(HttpResponse::StatusCode::k400BadRequest, "Bad Request");
+        resp->setContentType("application/json");
+        resp->setBody(R"({"error":"unsafe filename"})");
+        return;
+    }
+    std::string path = std::string(kFilesDir) + "/" + file.filename;
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+        resp->setStatus(HttpResponse::StatusCode::k500InternalServerError, "Internal Server Error");
+        resp->setContentType("application/json");
+        resp->setBody(R"({"error":"cannot write file"})");
+        return;
+    }
+    ofs.write(file.data.data(), static_cast<std::streamsize>(file.data.size()));
+    LOG_INFO << "[files] uploaded " << file.filename << " (" << file.data.size() << " bytes)";
+    resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
+    resp->setContentType("application/json");
+    resp->setBody("{\"ok\":true,\"name\":\"" + jsonEscape(file.filename) +
+                  "\",\"size\":" + std::to_string(file.data.size()) + "}");
+}
+
+static void handleApiFilesDelete(const HttpRequest &req, HttpResponse *resp) {
+    std::string url = req.url();
+    constexpr const char *kPrefix = "/api/files/";
+    if (url.compare(0, std::strlen(kPrefix), kPrefix) != 0) {
+        resp->setStatus(HttpResponse::StatusCode::k404NotFound, "Not Found");
+        resp->setContentType("application/json");
+        resp->setBody(R"({"error":"missing filename"})");
+        return;
+    }
+    std::string name = url.substr(std::strlen(kPrefix));
+    if (!isSafeFilename(name)) {
+        resp->setStatus(HttpResponse::StatusCode::k400BadRequest, "Bad Request");
+        resp->setContentType("application/json");
+        resp->setBody(R"({"error":"unsafe filename"})");
+        return;
+    }
+    std::string path = std::string(kFilesDir) + "/" + name;
+    if (::unlink(path.c_str()) != 0) {
+        resp->setStatus(HttpResponse::StatusCode::k404NotFound, "Not Found");
+        resp->setContentType("application/json");
+        resp->setBody(R"({"error":"file not found"})");
+        return;
+    }
+    LOG_INFO << "[files] deleted " << name;
+    resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
+    resp->setContentType("application/json");
+    resp->setBody(R"({"ok":true})");
+}
+
+// /api/files 与 /api/files/<name> 共用入口（按 method 分发）
+static void handleApiFiles(const HttpRequest &req, HttpResponse *resp) {
+    using M = HttpRequest::Method;
+    switch (req.method()) {
+    case M::kGet:    handleApiFilesList(req, resp); break;
+    case M::kPost:   handleApiFilesUpload(req, resp); break;
+    case M::kDelete: handleApiFilesDelete(req, resp); break;
+    default:
+        resp->setStatus(HttpResponse::StatusCode::k404NotFound, "Not Found");
+        resp->setContentType("application/json");
+        resp->setBody(R"({"error":"method not allowed"})");
+    }
+}
+
 // ── 路由处理器：静态文件（前缀路由 /static/* → ./static/，/files/* → ./files/）
 //   - 自动 MIME 推断
 //   - ETag + If-None-Match → 304
@@ -157,22 +295,42 @@ static void handleStatic(const HttpRequest &req, HttpResponse *resp) {
 // ── 中间件：访问日志 + Metrics 计时 ──────────────────────────────────────────
 //   洋葱模型最外层：next() 之前打"入"日志，next() 之后打"出"日志和耗时
 static HttpServer::Middleware makeAccessLogMiddleware() {
-    return [](const HttpRequest &req, HttpResponse *resp,
-              const HttpServer::MiddlewareNext &next) {
+    return [](const HttpRequest &req, HttpResponse *resp, const HttpServer::MiddlewareNext &next) {
         auto start = std::chrono::steady_clock::now();
         next();
         auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now() - start)
                            .count();
         ServerMetrics::instance().onRequestComplete(static_cast<int>(resp->statusCode()), elapsed);
-        LOG_INFO << "[access] " << req.methodString() << ' ' << req.url()
-                 << " -> " << static_cast<int>(resp->statusCode()) << ' ' << elapsed << "us";
+        LOG_INFO << "[access] " << req.methodString() << ' ' << req.url() << " -> "
+                 << static_cast<int>(resp->statusCode()) << ' ' << elapsed << "us";
     };
 }
 
 // ── 主程序 ────────────────────────────────────────────────────────────────────
-int main() {
+int main(int argc, char *argv[]) {
     Logger::setLogLevel(Logger::INFO);
+
+    // 异步日志：将所有 LOG_* 输出重定向到文件（双缓冲，不阻塞业务线程）。
+    // 必须在 chdir 之前创建，以便日志文件落在二进制所在目录（build/examples/）。
+    // 日志文件命名格式： airi_server.<日期>.<pid>.log
+    AsyncLogging asyncLog("airi_server");
+    asyncLog.start();
+    Logger::setOutput([&asyncLog](const char *data, int len) { asyncLog.append(data, len); });
+    Logger::setFlush([]() {});  // 刷写由后端线程按间隔自动完成，前端无需毎条刷
+
+    // 自动 chdir 到二进制所在目录，使 ./examples/http_server 在 build/ 下也能
+    // 找到 static/、files/，无需用户手动 cd 进 build/examples/。
+    if (argc > 0 && argv[0] != nullptr) {
+        std::string exe(argv[0]);
+        auto slash = exe.find_last_of('/');
+        if (slash != std::string::npos) {
+            std::string dir = exe.substr(0, slash);
+            if (chdir(dir.c_str()) != 0) {
+                std::cerr << "warning: chdir(" << dir << ") failed\n";
+            }
+        }
+    }
 
     // ── HTTP Server 配置 ──────────────────────────────────────────────────────
     HttpServer::Options options;
@@ -182,7 +340,7 @@ int main() {
     if (const char *envPort = std::getenv("MYCPPSERVER_BIND_PORT")) {
         options.tcp.listenPort = static_cast<uint16_t>(std::atoi(envPort));
     }
-    options.tcp.ioThreads = 0;        // 自动按硬件线程数
+    options.tcp.ioThreads = 0; // 自动按硬件线程数
     options.tcp.maxConnections = 10000;
     options.requestTimeoutSec = 15.0; // Slowloris 防护
     options.idleTimeoutSec = 60.0;
@@ -226,6 +384,7 @@ int main() {
     auth.addPublicPath("/favicon.ico");
     auth.addPublicPrefix("/static/");
     auth.addPublicPrefix("/files/");
+    auth.addPublicPrefix("/api/files");
     srv.use(auth.toMiddleware());
 
     // gzip：响应体 ≥ 256 字节 + Content-Type 可压缩 + 客户端支持 → 压缩
@@ -240,6 +399,9 @@ int main() {
     srv.addRoute(M::kGet, "/health", handleHealth);
     srv.addRoute(M::kGet, "/metrics", handleMetrics);
     srv.addRoute(M::kGet, "/api/users", handleApiUsers);
+    srv.addRoute(M::kGet, "/api/files", handleApiFiles);
+    srv.addRoute(M::kPost, "/api/files", handleApiFiles);
+    srv.addPrefixRoute(M::kDelete, "/api/files/", handleApiFiles);
     srv.addPrefixRoute(M::kGet, "/static/", handleStatic);
     srv.addPrefixRoute(M::kGet, "/files/", handleStatic);
 
@@ -255,13 +417,14 @@ int main() {
 
     // ── 启动 ──────────────────────────────────────────────────────────────────
     LOG_INFO << "──────────────────────────────────────────────────────────────";
-    LOG_INFO << "  Airi-Cpp-Server-Lib demo listening on http://"
-             << options.tcp.listenIp << ":" << options.tcp.listenPort;
-    LOG_INFO << "  Routes:  /  /health  /metrics  /api/users  /static/*  /files/*";
+    LOG_INFO << "  Airi-Cpp-Server-Lib demo listening on http://" << options.tcp.listenIp << ":"
+             << options.tcp.listenPort;
+    LOG_INFO << "  Routes:  /  /health  /metrics  /api/users  /api/files  /static/*  /files/*";
     LOG_INFO << "  Demo bearer token : " << kDemoBearerToken;
     LOG_INFO << "  Demo API key      : " << kDemoApiKey;
     LOG_INFO << "──────────────────────────────────────────────────────────────";
 
     srv.start();
+    asyncLog.stop(); // 优雅关闭：等待后端线程将死区日志全部刷盘
     return 0;
 }

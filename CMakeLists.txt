@@ -154,36 +154,48 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Airi-Cpp-Server-Lib
 )
 
-# 2. Demo / manual-run programs
-add_executable(StressTest src/test/StressTest.cpp)
+# ── 输出目录约定 ──────────────────────────────────────────────
+#   build/examples/   — 面向使用者的演示服务器（http_server、demo_server）
+#   build/tests/      — GoogleTest 二进制（ctest 默认调用）
+#   build/tools/      — 手动运行的测试/压测小工具（需 cmake --build --target ... 显式构建）
+set(MCPP_EXAMPLE_DIR ${CMAKE_BINARY_DIR}/examples)
+set(MCPP_TEST_DIR    ${CMAKE_BINARY_DIR}/tests)
+set(MCPP_TOOL_DIR    ${CMAKE_BINARY_DIR}/tools)
+
+# ── 手动运行的小工具（默认不充入 ALL，不会出现在 build/ 根上）────────
+add_executable(StressTest EXCLUDE_FROM_ALL src/test/StressTest.cpp)
 target_link_libraries(StressTest NetLib pthread)
+set_target_properties(StressTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
 
-add_executable(TimerTest src/test/TimerTest.cpp)
+add_executable(TimerTest EXCLUDE_FROM_ALL src/test/TimerTest.cpp)
 target_link_libraries(TimerTest NetLib pthread)
+set_target_properties(TimerTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
 
-add_executable(LogTest src/test/LogTest.cpp)
+add_executable(LogTest EXCLUDE_FROM_ALL src/test/LogTest.cpp)
 target_link_libraries(LogTest NetLib pthread)
+set_target_properties(LogTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
 
-# 注：性能基准测试不再使用自研客户端，统一改为业界标准 wrk + Docker 真实对照
-# 见 benchmark/muduo_compare/  (跑 wrk 压测，对比 muduo)
+# 性能基准统一交给业界标准 wrk + Docker，见 benchmark/muduo_compare/
 
-# Phase 4 演示服务器
-add_executable(demo_server demo/demo_server.cpp)
+# Phase 4 早期演示服务器（仅作历史参考，默认不构建）
+add_executable(demo_server EXCLUDE_FROM_ALL demo/demo_server.cpp)
 target_link_libraries(demo_server NetLib pthread)
+set_target_properties(demo_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
 
-# 全特性演示服务器（中间件链 / 限流 / 鉴权 / CORS / gzip / 静态文件）
-add_executable(app_demo examples/src/http_server.cpp)
-target_link_libraries(app_demo NetLib pthread)
+# ── 主演示服务器（中间件链 / 限流 / 鉴权 / CORS / gzip / 静态文件）────
+add_executable(http_server examples/src/http_server.cpp)
+target_link_libraries(http_server NetLib pthread)
+set_target_properties(http_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
 if(ZLIB_FOUND)
-    target_link_libraries(app_demo ZLIB::ZLIB)
-    target_compile_definitions(app_demo PRIVATE HAS_ZLIB=1)
+    target_link_libraries(http_server ZLIB::ZLIB)
+    target_compile_definitions(http_server PRIVATE HAS_ZLIB=1)
 endif()
-# 复制静态资源到 build 目录，使 ./app_demo 在 build/ 下能找到 static/、files/
-add_custom_command(TARGET app_demo POST_BUILD
+# 静态资源复制到二进制同级的 examples/，让 ./examples/http_server 在 build/ 下能找到 static/、files/
+add_custom_command(TARGET http_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_SOURCE_DIR}/examples/static ${CMAKE_BINARY_DIR}/static
+            ${CMAKE_SOURCE_DIR}/examples/static ${MCPP_EXAMPLE_DIR}/static
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_SOURCE_DIR}/examples/files  ${CMAKE_BINARY_DIR}/files)
+            ${CMAKE_SOURCE_DIR}/examples/files  ${MCPP_EXAMPLE_DIR}/files)
 
 # ── GoogleTest + CTest ──────────────────────────────────────────
 if(MCPP_ENABLE_TESTING)
@@ -200,11 +212,12 @@ if(MCPP_ENABLE_TESTING)
     enable_testing()
     include(GoogleTest)
 
-    # 辅助函数：注册一个 gtest 可执行文件
+    # 辅助函数：注册一个 gtest 可执行文件到 build/tests/
     function(mcpp_add_test NAME)
         add_executable(${NAME} src/test/${NAME}.cpp)
         target_link_libraries(${NAME} PRIVATE NetLib GTest::gtest_main pthread)
-        gtest_discover_tests(${NAME})
+        set_target_properties(${NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TEST_DIR})
+        gtest_discover_tests(${NAME} WORKING_DIRECTORY ${MCPP_TEST_DIR})
     endfunction()
 
     mcpp_add_test(HttpContextTest)
