@@ -1,12 +1,21 @@
 {
   // VS Code 任务：构建 / 运行 / 压测一站式入口。
-  // 任务依赖图：
-  //   cmake:configure
-  //     ├─ build:lib          (libAiri-Cpp-Server-Lib.a)
-  //     ├─ build:example      (examples/http_server) ─ 含库链接
-  //     └─ build:bench        (tools/conn_scale_test)
-  //   run:server              ← build:example
-  //   bench:wrk+rss           ← build:example, build:bench
+  //
+  // 构建任务
+  //   cmake:configure  →  build:all（NetLib + http_server + kv_node + conn_scale_test）
+  //                    →  build:lib / build:example / build:kv / build:bench（单目标增量构建）
+  //
+  // 运行 / 压测任务
+  //   run:server        ← build:example
+  //   bench:wrk         （需先 run:server）
+  //   bench:wrk-ramp    （需先 run:server）
+  //   bench:wrk+rss     ← build:all → 脚本自动拉起并停服
+  //   bench:flamegraph  ← build:example
+  //   bench:instruments ← build:example（macOS，需 sudo）
+  //
+  // 清理任务
+  //   clean:incremental  删编译产物，保留 CMakeCache（无需重新 configure）
+  //   clean:reconfigure  彻底删除 build/ 并重新 configure（完整重置）
   "version": "2.0.0",
   "options": {
     "cwd": "${workspaceFolder}",
@@ -42,10 +51,21 @@
       "command": "cmake",
       "args": ["--build", "build", "--target", "http_server", "-j"],
       "dependsOn": ["cmake:configure"],
-      "group": { "kind": "build", "isDefault": true },
+      "group": "build",
       "problemMatcher": ["$gcc"],
       "presentation": { "reveal": "always", "panel": "shared", "clear": true },
       "detail": "编译 examples/ 目录的示例服务器（隐式触发 NetLib）"
+    },
+    {
+      "label": "build:kv",
+      "type": "shell",
+      "command": "cmake",
+      "args": ["--build", "build", "--target", "kv_node", "-j"],
+      "dependsOn": ["cmake:configure"],
+      "group": "build",
+      "problemMatcher": ["$gcc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "detail": "编译 Raft KV 节点（输出 build/examples/kv_node）"
     },
     {
       "label": "build:bench",
@@ -60,10 +80,18 @@
     },
     {
       "label": "build:all",
-      "dependsOn": ["build:lib", "build:example", "build:bench"],
-      "dependsOrder": "parallel",
-      "problemMatcher": [],
-      "detail": "并行构建库 + 示例 + 压测工具"
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--build", "build",
+        "--target", "NetLib", "http_server", "kv_node", "conn_scale_test",
+        "-j"
+      ],
+      "dependsOn": ["cmake:configure"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "detail": "单次 cmake 调用并行构建库 + http_server + kv_node + 压测工具（消除多进程竞争）"
     },
     {
       "label": "run:server",
@@ -100,18 +128,6 @@
       "detail": "阶梯加压：10→50→200→500→1000→2000 并发，每档 20s，观察吞吐拐点与延迟膝点"
     },
     {
-      "label": "bench:wrk-mixed",
-      "type": "shell",
-      "command": "bash",
-      "args": [
-        "-c",
-        "PORT=${MYCPPSERVER_BIND_PORT}; ( wrk -t2 -c50 -d60s http://127.0.0.1:$PORT/ & wrk -t2 -c50 -d60s http://127.0.0.1:$PORT/files/readme.txt & wrk -t2 -c50 -d60s -H 'Authorization: Bearer secret-token-123' http://127.0.0.1:$PORT/api/users & wait )"
-      ],
-      "problemMatcher": [],
-      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
-      "detail": "混合负载：同时压 / + /files/readme.txt + /api/users（带 Auth），观察 dashboard 区分不同路径的影响"
-    },
-    {
       "label": "clean:incremental",
       "type": "shell",
       "command": "cmake",
@@ -119,15 +135,6 @@
       "problemMatcher": [],
       "presentation": { "reveal": "silent", "panel": "shared", "clear": false },
       "detail": "删除编译产物，保留 CMakeCache / Makefile（无需重新 configure）"
-    },
-    {
-      "label": "clean:full",
-      "type": "shell",
-      "command": "rm",
-      "args": ["-rf", "build"],
-      "problemMatcher": [],
-      "presentation": { "reveal": "silent", "panel": "shared", "clear": false },
-      "detail": "彻底删除 build/ 目录（下次构建前需重新 configure）"
     },
     {
       "label": "clean:reconfigure",
@@ -143,8 +150,7 @@
       "type": "shell",
       "command": "bash",
       "args": ["${workspaceFolder}/scripts/bench.sh"],
-      "dependsOn": ["build:example", "build:bench"],
-      "dependsOrder": "parallel",
+      "dependsOn": ["build:all"],
       "problemMatcher": [],
       "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
       "detail": "后台拉起示例服务器 → wrk 30s 压测 → RSS 长连接测试 → 自动停服"

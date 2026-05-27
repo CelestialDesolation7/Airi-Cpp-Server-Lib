@@ -179,6 +179,12 @@ set_target_properties(conn_scale_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP
 add_executable(http_server examples/src/http_server.cpp)
 target_link_libraries(http_server NetLib pthread)
 set_target_properties(http_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
+
+# rpc调用示例服务器
+add_executable(rpc_demo examples/src/rpc_demo.cpp)
+target_link_libraries(rpc_demo NetLib pthread)
+set_target_properties(rpc_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
+
 if(ZLIB_FOUND)
     target_link_libraries(http_server ZLIB::ZLIB)
     target_compile_definitions(http_server PRIVATE HAS_ZLIB=1)

@@ -9,8 +9,13 @@
     "--clang-tidy",               // 随编辑实时运行 clang-tidy（规则来自 .clang-tidy）
     "--completion-style=detailed",// 补全项显示参数类型
     "--header-insertion=never",   // 不自动插入 #include（C++ 项目中通常更安全）
-    "--inlay-hints=true",         // 参数名 / 返回类型 inlay hints
+    // 注：clangd 22 已移除 --inlay-hints 启动开关（默认开启），由
+    // editor.inlayHints.enabled / clangd.inlayHints.* 控制
     "--log=error"                 // 减少 clangd 自身的噪音日志
+    // 注：不使用 --query-driver。build/compile_commands.json 已含
+    // -isystem /opt/homebrew/include；--query-driver 同时生效时
+    // Apple SDK 路径与 Homebrew 头文件发生冲突 → fatal_too_many_errors。
+    // 系统头文件遮蔽问题已由 .clangd 的 -resource-dir 指向 AppleClang/clang/21 解决。
   ],
   // ── cmake-tools ──────────────────────────────────────────────────────────
   "cmake.buildDirectory": "${workspaceFolder}/build",
