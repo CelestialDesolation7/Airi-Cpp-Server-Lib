@@ -52,8 +52,8 @@ TcpServer::TcpServer(const Options &options) : options_(options) {
         throw std::runtime_error("tcp server tls init failed");
     }
 
-    LOG_INFO << "[TcpServer] Main Reactor + " << threadNum
-             << " Sub Reactors ready. listen=" << options_.listenIp << ":" << options_.listenPort
+    LOG_INFO << "[TcpServer] 主 Reactor + " << threadNum
+             << " 个 Sub Reactor 就绪，监听=" << options_.listenIp << ":" << options_.listenPort
              << " maxConnections=" << maxConnections_ << " tls=" << (tlsEnabled_ ? "on" : "off");
 }
 
@@ -181,7 +181,7 @@ void TcpServer::newConnection(int fd) {
     // 此时 connections_[fd] 已插入 map，回调均已就绪
     subLoop->queueInLoop([rawConn]() { rawConn->enableInLoop(); });
 
-    LOG_INFO << "[TcpServer] new connection fd=" << fd;
+    LOG_DEBUG << "[TcpServer] 新连接 fd=" << fd;
 }
 
 void TcpServer::deleteConnection(int fd) {
@@ -193,7 +193,7 @@ void TcpServer::deleteConnection(int fd) {
             Eventloop *ioLoop = it->second->getLoop();
             std::unique_ptr<Connection> conn = std::move(it->second);
             connections_.erase(it);
-            LOG_INFO << "[TcpServer] connection fd=" << fd << " deleted.";
+            LOG_DEBUG << "[TcpServer] 连接 fd=" << fd << " 已删除";
 
             // 将 Connection 析构投递到其归属 sub-reactor 线程执行：
             // 保证 Connection::~Connection()（调用 loop_->deleteChannel）

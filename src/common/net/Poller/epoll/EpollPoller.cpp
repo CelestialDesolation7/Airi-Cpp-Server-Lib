@@ -34,7 +34,7 @@ const char *epollOpName(int op) {
 EpollPoller::EpollPoller(Eventloop *loop) : Poller(loop), epollFd_(-1), events_(kInitialEvents) {
     epollFd_ = epoll_create1(0);
     if (epollFd_ == -1) {
-        LOG_FATAL << "epoll create error, errno=" << errno << " 错误=" << strerror(errno);
+        LOG_FATAL << "epoll 创建失败，errno=" << errno << " 错误=" << strerror(errno);
     }
 }
 

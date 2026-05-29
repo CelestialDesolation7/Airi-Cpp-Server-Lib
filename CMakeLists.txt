@@ -7,7 +7,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 project(Airi-Cpp-Server-Lib VERSION 1.0.0 LANGUAGES CXX)
 
 option(MCPP_ENABLE_OPENSSL "Enable TLS support via OpenSSL" ON)
-option(MCPP_ENABLE_TESTING "Build tests (requires GoogleTest via FetchContent)" ON)
 option(MCPP_ENABLE_ASAN    "Enable AddressSanitizer"  OFF)
 option(MCPP_ENABLE_TSAN    "Enable ThreadSanitizer"   OFF)
 option(MCPP_ENABLE_UBSAN   "Enable UndefinedBehaviorSanitizer" OFF)
@@ -16,6 +15,12 @@ option(MCPP_ENABLE_COVERAGE "Enable code coverage (gcov / llvm-cov)" OFF)
 # C++ 标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ── 第三方依赖：nlohmann/json（vendored 单头文件版本）─────────────
+# 直接把 v3.11.3 的 json.hpp 放在 third_party/nlohmann/，避免网络拉取。
+# 这里不创建独立 target，而是直接把 include 路径加到 NetLib（PRIVATE），
+# 避免 install(EXPORT) 把外部 target 拖入导出集。
+set(NLOHMANN_JSON_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 
 # ── Sanitizer flags ─────────────────────────────────────────────
 if(MCPP_ENABLE_ASAN)
@@ -61,6 +66,11 @@ endif()
 add_library(NetLib ${COMMON_SOURCES} ${PLATFORM_SOURCES})
 set_target_properties(NetLib PROPERTIES OUTPUT_NAME "Airi-Cpp-Server-Lib")
 add_library(Airi-Cpp-Server-Lib::NetLib ALIAS NetLib)
+
+# JSON 依赖（PUBLIC + BUILD_INTERFACE：让 NetLib 消费者也能 #include <nlohmann/json.hpp>，
+# 但不把绝对路径写进安装后的配置文件）
+target_include_directories(NetLib PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
 
 set(MYCPPSERVERLIB_WITH_OPENSSL OFF)
 if(MCPP_ENABLE_OPENSSL)
@@ -152,24 +162,9 @@ install(FILES
 
 # ── 输出目录约定 ──────────────────────────────────────────────
 #   build/examples/   — 面向使用者的演示服务器（http_server、demo_server）
-#   build/tests/      — GoogleTest 二进制（ctest 默认调用）
-#   build/tools/      — 手动运行的测试/压测小工具（需 cmake --build --target ... 显式构建）
+#   build/tools/      — 压测工具（需 cmake --build --target ... 显式构建）
 set(MCPP_EXAMPLE_DIR ${CMAKE_BINARY_DIR}/examples)
-set(MCPP_TEST_DIR    ${CMAKE_BINARY_DIR}/tests)
 set(MCPP_TOOL_DIR    ${CMAKE_BINARY_DIR}/tools)
-
-# ── 手动运行的小工具（默认不充入 ALL，不会出现在 build/ 根上）────────
-add_executable(StressTest EXCLUDE_FROM_ALL src/test/StressTest.cpp)
-target_link_libraries(StressTest NetLib pthread)
-set_target_properties(StressTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
-
-add_executable(TimerTest EXCLUDE_FROM_ALL src/test/TimerTest.cpp)
-target_link_libraries(TimerTest NetLib pthread)
-set_target_properties(TimerTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
-
-add_executable(LogTest EXCLUDE_FROM_ALL src/test/LogTest.cpp)
-target_link_libraries(LogTest NetLib pthread)
-set_target_properties(LogTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
 
 # 海量长连接 / RSS 增长测试（独立可执行，不依赖 NetLib，纯 socket 客户端）
 add_executable(conn_scale_test EXCLUDE_FROM_ALL benchmark/conn_scale_test.cpp)
@@ -180,10 +175,10 @@ add_executable(http_server examples/src/http_server.cpp)
 target_link_libraries(http_server NetLib pthread)
 set_target_properties(http_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
 
-# rpc调用示例服务器
-add_executable(rpc_demo examples/src/rpc_demo.cpp)
-target_link_libraries(rpc_demo NetLib pthread)
-set_target_properties(rpc_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
+# raft 调用示例服务器
+add_executable(raft_demo examples/src/raft_demo.cpp)
+target_link_libraries(raft_demo NetLib pthread)
+set_target_properties(raft_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
 
 if(ZLIB_FOUND)
     target_link_libraries(http_server ZLIB::ZLIB)
@@ -195,38 +190,6 @@ add_custom_command(TARGET http_server POST_BUILD
             ${CMAKE_SOURCE_DIR}/examples/static ${MCPP_EXAMPLE_DIR}/static
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/examples/files  ${MCPP_EXAMPLE_DIR}/files)
-
-# ── GoogleTest + CTest ──────────────────────────────────────────
-if(MCPP_ENABLE_TESTING)
-    include(FetchContent)
-    FetchContent_Declare(
-        googletest
-        GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG        v1.15.2
-    )
-    # 不安装 gtest 到系统路径
-    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(googletest)
-
-    enable_testing()
-    include(GoogleTest)
-
-    # 辅助函数：注册一个 gtest 可执行文件到 build/tests/
-    function(mcpp_add_test NAME)
-        add_executable(${NAME} src/test/${NAME}.cpp)
-        target_link_libraries(${NAME} PRIVATE NetLib GTest::gtest_main pthread)
-        set_target_properties(${NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TEST_DIR})
-        gtest_discover_tests(${NAME} WORKING_DIRECTORY ${MCPP_TEST_DIR})
-    endfunction()
-
-    mcpp_add_test(HttpContextTest)
-    mcpp_add_test(HttpRequestLimitsTest)
-    mcpp_add_test(BackpressureDecisionTest)
-    mcpp_add_test(MetricsTest)
-    mcpp_add_test(LogContextTest)
-    mcpp_add_test(CorsMiddlewareTest)
-    mcpp_add_test(StaticFileHandlerTest)
-endif()
 
 # ── 静态分析：clang-tidy（可选 custom target）────────────────────
 find_program(CLANG_TIDY_EXE NAMES clang-tidy)

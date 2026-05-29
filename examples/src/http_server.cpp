@@ -214,7 +214,7 @@ static void handleApiFilesUpload(const HttpRequest &req, HttpResponse *resp) {
         return;
     }
     ofs.write(file.data.data(), static_cast<std::streamsize>(file.data.size()));
-    LOG_INFO << "[files] uploaded " << file.filename << " (" << file.data.size() << " bytes)";
+    LOG_INFO << "[文件] 已上传 " << file.filename << "（" << file.data.size() << " 字节）";
     resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
     resp->setContentType("application/json");
     resp->setBody("{\"ok\":true,\"name\":\"" + jsonEscape(file.filename) +
@@ -244,7 +244,7 @@ static void handleApiFilesDelete(const HttpRequest &req, HttpResponse *resp) {
         resp->setBody(R"({"error":"file not found"})");
         return;
     }
-    LOG_INFO << "[files] deleted " << name;
+    LOG_INFO << "[文件] 已删除 " << name;
     resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
     resp->setContentType("application/json");
     resp->setBody(R"({"ok":true})");
@@ -409,21 +409,21 @@ int main(int argc, char *argv[]) {
 
     // ── 优雅关闭 ──────────────────────────────────────────────────────────────
     Signal::signal(SIGINT, [&srv]() {
-        LOG_INFO << "[main] SIGINT received, stopping server...";
+        LOG_INFO << "[主进程] 收到 SIGINT，正在停止服务...";
         srv.stop();
     });
     Signal::signal(SIGTERM, [&srv]() {
-        LOG_INFO << "[main] SIGTERM received, stopping server...";
+        LOG_INFO << "[主进程] 收到 SIGTERM，正在停止服务...";
         srv.stop();
     });
 
     // ── 启动 ──────────────────────────────────────────────────────────────────
     LOG_INFO << "──────────────────────────────────────────────────────────────";
-    LOG_INFO << "  Airi-Cpp-Server-Lib demo listening on http://" << options.tcp.listenIp << ":"
+    LOG_INFO << "  Airi-Cpp-Server-Lib 示例服务已启动，监听 http://" << options.tcp.listenIp << ":"
              << options.tcp.listenPort;
-    LOG_INFO << "  Routes:  /  /health  /metrics  /api/users  /api/files  /static/*  /files/*";
-    LOG_INFO << "  Demo bearer token : " << kDemoBearerToken;
-    LOG_INFO << "  Demo API key      : " << kDemoApiKey;
+    LOG_INFO << "  路由：  /  /health  /metrics  /api/users  /api/files  /static/*  /files/*";
+    LOG_INFO << "  演示 Bearer token  : " << kDemoBearerToken;
+    LOG_INFO << "  演示 API key       : " << kDemoApiKey;
     LOG_INFO << "──────────────────────────────────────────────────────────────";
 
     srv.start();

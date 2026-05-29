@@ -83,7 +83,7 @@ void HttpServer::onNewConnection(Connection *conn) {
     if (autoClose_)
         scheduleIdleClose(conn);
 
-    LOG_INFO << "[HttpServer] new connection fd=" << conn->getSocket()->getFd();
+    LOG_INFO << "[HttpServer] 新连接 fd=" << conn->getSocket()->getFd();
 }
 
 // ── 空闲超时定时器（递归调度）────────────────────────────────────────────────
@@ -107,7 +107,7 @@ void HttpServer::scheduleIdleClose(Connection *conn) {
             // 连接仍然活跃，重新调度下一次检测
             scheduleIdleClose(conn);
         } else {
-            LOG_INFO << "[HttpServer] idle timeout, closing fd=" << conn->getSocket()->getFd();
+            LOG_INFO << "[HttpServer] 空闲超时，关闭 fd=" << conn->getSocket()->getFd();
             conn->close();
         }
     });
