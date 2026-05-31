@@ -205,6 +205,12 @@ add_executable(raft_demo examples/src/raft_demo.cpp)
 target_link_libraries(raft_demo NetLib pthread)
 set_target_properties(raft_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
 
+# L7 反向代理负载均衡 Demo
+add_executable(lb_demo examples/src/lb_demo.cpp)
+target_link_libraries(lb_demo NetLib pthread)
+set_target_properties(lb_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
+
+
 if(ZLIB_FOUND)
     target_link_libraries(http_server ZLIB::ZLIB)
     target_compile_definitions(http_server PRIVATE HAS_ZLIB=1)

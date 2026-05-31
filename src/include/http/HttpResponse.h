@@ -12,7 +12,8 @@ class HttpResponse {
         k204NoContent = 204,
         k206PartialContent = 206,
         k200OK = 200,
-        k302Found = 302, // 临时重定向（Location 头指定新地址）
+        k302Found = 302,              // 临时重定向（Location 头指定新地址）
+        k307TemporaryRedirect = 307,  // 临时重定向，保留原始 Method（PUT/DELETE 不变）
         k304NotModified = 304,
         k400BadRequest = 400,
         k403Forbidden = 403,
@@ -22,6 +23,8 @@ class HttpResponse {
         k416RangeNotSatisfiable = 416,
         k429TooManyRequests = 429,
         k500InternalServerError = 500,
+        k502BadGateway = 502,
+        k503ServiceUnavailable = 503,
     };
 
     explicit HttpResponse(bool closeConnection = false);
@@ -60,6 +63,11 @@ class HttpResponse {
     size_t sendFileCount() const { return sendFileCount_; }
     void clearSendFile();
 
+    // 异步响应标记：handler 自行调用 conn->send()，HttpServer::onRequest 跳过发送。
+    // 配合 AsyncRouteHandler 使用，用于实现非阻塞流式响应（Chunked Streaming）。
+    void setDeferred(bool d = true) { deferred_ = d; }
+    bool isDeferred() const { return deferred_; }
+
     // 序列化为可发送的字节流（自动填充 Content-Length / Connection）
     std::string serialize() const;
 
@@ -70,6 +78,7 @@ class HttpResponse {
     std::string body_;
     bool closeConnection_;
 
+    bool deferred_{false};
     bool useSendFile_{false};
     std::string sendFilePath_;
     size_t sendFileOffset_{0};
