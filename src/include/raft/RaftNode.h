@@ -11,6 +11,7 @@
 //
 #include "EventLoop.h"
 #include "coro/Task.h"
+#include "raft/RaftStorage.h"
 #include "raft/RaftTypes.h"
 #include "rpc/AsyncRpcClient.h"
 #include "rpc/RpcServer.h"
@@ -59,6 +60,18 @@ class RaftNode {
     // 返回时命令已入队（异步执行），不等待提交完成。
     void propose(const std::string &cmd);
 
+    // ── 持久化（必须在 start() 之前注册）────────────────────────────────
+    // 不调用 = 纯内存模式（崩溃后状态丢失）。
+    // 调用后，term/votedFor/log/snapshot 均自动落盘，重启后自动恢复。
+    void setStorage(std::unique_ptr<RaftStorage> storage) {
+        storage_ = std::move(storage);
+    }
+
+    // ── 日志压缩（可从任意线程调用；实际执行在 loop_ 线程）──────────────
+    // data：状态机快照序列化结果（对 Raft 透明）。
+    // 调用后 log_ 中快照点之前的条目会被删除，对落后 peer 改发 InstallSnapshot。
+    void takeSnapshot(const std::string &data);
+
     // ── 状态机回调（必须在 start() 之前注册）────────────────────────────
     // 当 lastApplied 推进时，在 loop_ 线程回调 cb(index, cmd)。
     void setApplyCallback(std::function<void(uint64_t, const std::string &)> cb) {
@@ -69,6 +82,7 @@ class RaftNode {
     // ── RPC server 回调（由 sub-reactor 线程调用，内部异步投递到 loop_）──
     void handleRequestVote(const std::string &reqJson, RpcServer::Done done);
     void handleAppendEntries(const std::string &reqJson, RpcServer::Done done);
+    void handleInstallSnapshot(const std::string &reqJson, RpcServer::Done done);
 
     // ── 以下所有方法都必须在 loop_ 线程执行 ─────────────────────────
     void becomeFollower(uint64_t term);
@@ -86,6 +100,7 @@ class RaftNode {
     // 无新条目时 entries=[] 作为心跳；有新条目时附带日志段
     void          heartbeatTick();
     FireAndForget replicateLog(Peer peer);
+    FireAndForget sendInstallSnapshot(Peer peer);  // Day34：快照传输
 
     // 提交推进：Leader 在 matchIndex 更新后调用
     // 找到满足「多数 matchIndex[i] >= N 且 log[N].term == currentTerm」的最大 N
@@ -93,10 +108,18 @@ class RaftNode {
     // 应用已提交但尚未 apply 的条目（lastApplied → commitIndex）
     void applyCommitted();
 
+    // ── 索引辅助 ─────────────────────────────────────────────────────
     uint64_t lastLogIndex() const;
-    uint64_t lastLogTerm() const;
+    uint64_t lastLogTerm()  const;
+    // 全局 index → log_ 局部下标（必须在 snapshotIndex_ <= idx <= lastLogIndex() 时调用）
+    LogEntry       &logAt(uint64_t globalIdx);
+    const LogEntry &logAt(uint64_t globalIdx) const;
 
-    // 在 loop_ 线程内 lazy 创建 peer 对应的 AsyncRpcClient
+    // ── 持久化辅助（loop_ 线程调用）──────────────────────────────────
+    void persistHardState();  // 落盘 currentTerm_ + votedFor_
+    void persistLog();        // 落盘 log_[1..] （快照点之后的全量条目）
+
+    // ── RPC 客户端缓存 ────────────────────────────────────────────────
     AsyncRpcClient *getOrCreateClient(const Peer &peer);
 
     // ── 配置 ────────────────────────────────────────────────────────────
@@ -107,7 +130,7 @@ class RaftNode {
     // ── Raft 状态（只在 loop_ 线程读写；外部只读字段额外用 atomic 暴露）──
     std::atomic<uint64_t> currentTerm_{0};
     int                   votedFor_{-1};
-    std::vector<LogEntry> log_;           // log_[0] 是哨兵条目（term=0）
+    std::vector<LogEntry> log_;           // log_[0] 是哨兵条目（无快照时 term=0）
     std::atomic<State>    state_{State::Follower};
     int                   leaderId_{-1};
     int                   currentElectionVotes_{0};
@@ -120,6 +143,17 @@ class RaftNode {
     // Leader 专属（仅在 loop_ 线程访问，becomeLeader 初始化，角色切换后可能过时）
     std::unordered_map<int, uint64_t> nextIndex_;   // peer.id → 下次发送的 index
     std::unordered_map<int, uint64_t> matchIndex_;  // peer.id → 已确认复制的最高 index
+
+    // ── 快照状态（loop_ 线程访问）───────────────────────────────────────
+    // snapshotIndex_ 是 log_[0] 哨兵代表的全局 index：
+    //   全局 index i 对应 log_[i - snapshotIndex_]
+    // 初始 snapshotIndex_=0，log_[0].term=0（无快照的哨兵）。
+    uint64_t    snapshotIndex_{0};
+    uint64_t    snapshotTerm_{0};
+    std::string snapshotData_;  // 状态机快照数据（Raft 透明）
+
+    // ── 持久化后端（nullptr = 纯内存）───────────────────────────────────
+    std::unique_ptr<RaftStorage> storage_;
 
     // 状态机回调：commit 推进时在 loop_ 线程回调
     std::function<void(uint64_t, const std::string &)> applyCallback_;

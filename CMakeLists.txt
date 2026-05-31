@@ -50,6 +50,21 @@ list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/Poller/kqueue/.*")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/EventLoop/epoll/.*")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/EventLoop/kqueue/.*")
 
+# ── 第三方依赖：RocksDB（可选；brew install rocksdb）────────────────────────
+find_library(ROCKSDB_LIB rocksdb
+    HINTS /opt/homebrew/lib /usr/local/lib)
+find_path(ROCKSDB_INCLUDE_DIR rocksdb/db.h
+    HINTS /opt/homebrew/include /usr/local/include)
+if(ROCKSDB_LIB AND ROCKSDB_INCLUDE_DIR)
+    set(MCPP_HAS_ROCKSDB ON)
+    message(STATUS "Airi-Cpp-Server-Lib: RocksDB found at ${ROCKSDB_LIB}")
+else()
+    set(MCPP_HAS_ROCKSDB OFF)
+    message(STATUS "Airi-Cpp-Server-Lib: RocksDB not found — RocksDBStorage 已从构建中排除 (brew install rocksdb)")
+    list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/RocksDBStorage\\.cpp")
+endif()
+
+
 # 按平台加入唯一的那个实现文件
 set(PLATFORM_SOURCES "")
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
@@ -64,6 +79,15 @@ endif()
 
 # 1. 核心库 (将决定权交给使用者)
 add_library(NetLib ${COMMON_SOURCES} ${PLATFORM_SOURCES})
+
+# RocksDB 链接（可选）
+if(MCPP_HAS_ROCKSDB)
+    target_include_directories(NetLib PUBLIC
+        $<BUILD_INTERFACE:${ROCKSDB_INCLUDE_DIR}>)
+    target_link_libraries(NetLib PUBLIC "${ROCKSDB_LIB}")
+    target_compile_definitions(NetLib PUBLIC MCPP_HAS_ROCKSDB=1)
+endif()
+
 set_target_properties(NetLib PROPERTIES OUTPUT_NAME "Airi-Cpp-Server-Lib")
 add_library(Airi-Cpp-Server-Lib::NetLib ALIAS NetLib)
 

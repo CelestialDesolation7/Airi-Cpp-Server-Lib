@@ -1,13 +1,14 @@
-// RaftNode.cpp —— Raft 共识节点（选举 + 日志复制 + C++20 协程）
+// RaftNode.cpp —— Raft 共识节点（选举 + 日志复制 + 持久化 + 快照 + C++20 协程）
 //
 // 阅读顺序：
-//   §1 构造 / 析构 / start / stop      —— 线程编排与生命周期
-//   §2 RPC server 回调（fire-and-forget）—— sub-reactor 不再被阻塞
+//   §1 构造 / 析构 / start / stop      —— 线程编排与生命周期（含持久化恢复）
+//   §2 RPC server 回调（fire-and-forget）—— AppendEntries / InstallSnapshot
 //   §3 角色切换 + 选举定时器           —— 全部在 loop_ 线程，无锁
 //   §4 选举：runElection + collectVote 协程
-//   §5 日志复制 + 心跳：heartbeatTick + replicateLog 协程
+//   §5 日志复制 + 心跳：heartbeatTick + replicateLog + sendInstallSnapshot 协程
 //   §6 提交推进：advanceCommitIndex + applyCommitted
-//   §7 外部写入接口：propose
+//   §7 外部写入接口：propose + takeSnapshot
+//   §8 辅助：lastLogIndex / lastLogTerm / logAt / persistHardState / persistLog
 //
 #include "raft/RaftNode.h"
 #include "log/Logger.h"
@@ -45,6 +46,11 @@ RaftNode::RaftNode(int id, std::vector<Peer> peers, uint16_t rpcPort)
         [this](const std::string &req, RpcServer::Done done) {
             handleAppendEntries(req, std::move(done));
         });
+    rpcServer_.addHandler(
+        "InstallSnapshot",
+        [this](const std::string &req, RpcServer::Done done) {
+            handleInstallSnapshot(req, std::move(done));
+        });
 }
 
 RaftNode::~RaftNode() { stop(); }
@@ -54,7 +60,39 @@ void RaftNode::start() {
 
     // (a) Eventloop 线程：所有 Raft 状态变迁 + 出站 RPC IO 都在这条线程上
     loopThread_ = std::thread([this] {
-        loop_.runInLoop([this] { resetElectionTimer(); });
+        loop_.runInLoop([this] {
+            // ── 持久化恢复（必须在 loop_ 线程，确保无竞争）──────────────
+            if (storage_) {
+                // ① 恢复 HardState：term + votedFor
+                auto hs = storage_->loadHardState();
+                currentTerm_.store(hs.term);
+                votedFor_ = hs.votedFor;
+
+                // ② 恢复快照：重设哨兵并推进 commitIndex/lastApplied
+                uint64_t snapIdx{0}, snapTerm{0};
+                std::string snapData;
+                if (storage_->loadSnapshot(snapIdx, snapTerm, snapData)) {
+                    snapshotIndex_ = snapIdx;
+                    snapshotTerm_  = snapTerm;
+                    snapshotData_  = snapData;
+                    log_.clear();
+                    log_.push_back(LogEntry{snapTerm, ""}); // 新哨兵
+                    commitIndex_.store(snapIdx);
+                    lastApplied_.store(snapIdx);
+                }
+
+                // ③ 恢复快照点之后的日志条目
+                auto entries = storage_->loadLog();
+                log_.insert(log_.end(), entries.begin(), entries.end());
+
+                LOG_INFO << "[Node " << id_ << "] 从持久化存储恢复："
+                         << " term=" << currentTerm_.load()
+                         << " votedFor=" << votedFor_
+                         << " snapshotIndex=" << snapshotIndex_
+                         << " logSize=" << (log_.size() - 1) << " 条";
+            }
+            resetElectionTimer();
+        });
         loop_.runEvery(0.05, [this] { heartbeatTick(); });
         loop_.loop();
     });
@@ -133,6 +171,7 @@ void RaftNode::handleRequestVote(const std::string &reqJson, RpcServer::Done don
             // 收到合法投票请求后重置自己的选举计时器：
             // 既然已经有候选人在运作，就不要再发起竞争选举，让它先跑完。
             resetElectionTimer();
+            persistHardState();  // votedFor 变化必须立即落盘
             LOG_INFO << "[Node " << id_ << "] 已投票给节点 " << args.candidateId
                      << "，term=" << args.term;
         }
@@ -171,6 +210,14 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
         //
         // 这是 Raft 的核心安全机制：Leader 通过「前缀匹配」保证 Follower 和自己历史一致。
         // 若这里不匹配，Follower 无法安全追加 entries，必须拒绝并给出冲突提示。
+
+        // 快照点之前的条目已压缩，Leader 不应该再发 prevLogIndex < snapshotIndex_，
+        // 但防御性处理：视为已一致（Leader 应已发过 InstallSnapshot 覆盖了这部分）。
+        if (args.prevLogIndex < snapshotIndex_) {
+            reply.success = true;
+            done(json(reply).dump());
+            return;
+        }
         if (args.prevLogIndex > lastLogIndex()) {
             // Follower 日志太短，根本没有 prevLogIndex 处的条目
             reply.conflictIndex = lastLogIndex() + 1;  // 告知 Leader 从这里开始重发
@@ -178,12 +225,13 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
             done(json(reply).dump());
             return;
         }
-        if (log_[args.prevLogIndex].term != args.prevLogTerm) {
+        if (logAt(args.prevLogIndex).term != args.prevLogTerm) {
             // prevLogIndex 处 term 不匹配：找到该冲突 term 在我这里的第一条 index，
             // 让 Leader 跳过整个冲突 term（比逐条 -1 快得多）
-            uint64_t ct  = log_[args.prevLogIndex].term;
-            uint64_t ci  = args.prevLogIndex;
-            while (ci > 0 && log_[ci - 1].term == ct) --ci;
+            uint64_t ct = logAt(args.prevLogIndex).term;
+            uint64_t ci = args.prevLogIndex;
+            // 不能回退到快照点之前（那部分已压缩，log_ 里没有）
+            while (ci > snapshotIndex_ && logAt(ci - 1).term == ct) --ci;
             reply.conflictIndex = ci;
             reply.conflictTerm  = ct;
             done(json(reply).dump());
@@ -196,9 +244,9 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
         uint64_t insertAt = args.prevLogIndex + 1;
         for (size_t i = 0; i < args.entries.size(); ++i) {
             uint64_t logIdx = insertAt + (uint64_t)i;
-            if (logIdx < log_.size()) {
-                if (log_[logIdx].term != args.entries[i].term) {
-                    log_.resize(logIdx);          // 截断冲突点之后的所有条目
+            if (logIdx <= lastLogIndex()) {
+                if (logAt(logIdx).term != args.entries[i].term) {
+                    log_.resize(logIdx - snapshotIndex_); // 截断冲突点之后的所有条目
                     log_.push_back(args.entries[i]);
                 }
                 // else：term 相同 = 已有该条目（重传），跳过
@@ -206,6 +254,8 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
                 log_.push_back(args.entries[i]); // 追加新条目
             }
         }
+        // 日志变更后落盘（全量覆盖写）
+        persistLog();
 
         // 规则④：推进 commitIndex
         // Leader 已提交到 leaderCommit，我也可以安全应用到同样位置（取两者较小）
@@ -215,6 +265,79 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
         }
 
         reply.success = true;
+        done(json(reply).dump());
+    });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §2b  InstallSnapshot handler
+//
+// 当 Follower 严重落后（nextIndex <= snapshotIndex_），Leader 改发快照。
+// Follower 用快照替换本地日志前缀，保留快照点之后已有的条目，
+// 并更新 commitIndex/lastApplied 到快照点（无需逐条 apply）。
+// ════════════════════════════════════════════════════════════════════════════
+
+void RaftNode::handleInstallSnapshot(const std::string &reqJson, RpcServer::Done done) {
+    InstallSnapshotArgs args;
+    try {
+        args = json::parse(reqJson).get<InstallSnapshotArgs>();
+    } catch (...) {
+        done(R"({"term":0})");
+        return;
+    }
+
+    loop_.runInLoop([this, args, done = std::move(done)]() mutable {
+        if (args.term > currentTerm_.load()) becomeFollower(args.term);
+
+        InstallSnapshotReply reply{currentTerm_.load()};
+        if (args.term < currentTerm_.load()) {
+            done(json(reply).dump());
+            return;
+        }
+
+        state_.store(State::Follower);
+        leaderId_ = args.leaderId;
+        resetElectionTimer();
+
+        // 快照比我现有的更旧：忽略（避免状态倒退）
+        if (args.lastIncludedIndex <= snapshotIndex_) {
+            done(json(reply).dump());
+            return;
+        }
+
+        LOG_INFO << "[Node " << id_ << "] 安装快照 lastIndex=" << args.lastIncludedIndex
+                 << " lastTerm=" << args.lastIncludedTerm;
+
+        // 保留快照点之后我已有的日志条目（避免丢弃已知的更新条目）
+        std::vector<LogEntry> retained;
+        if (args.lastIncludedIndex < lastLogIndex()) {
+            // 从旧 log_ 中截取快照点之后的部分
+            uint64_t keepFrom = args.lastIncludedIndex - snapshotIndex_ + 1; // 局部下标
+            if (keepFrom < log_.size())
+                retained = std::vector<LogEntry>(log_.begin() + keepFrom, log_.end());
+        }
+
+        // 重建 log_：新哨兵（term = lastIncludedTerm）+ 保留条目
+        log_.clear();
+        log_.push_back(LogEntry{args.lastIncludedTerm, ""});
+        log_.insert(log_.end(), retained.begin(), retained.end());
+
+        snapshotIndex_ = args.lastIncludedIndex;
+        snapshotTerm_  = args.lastIncludedTerm;
+        snapshotData_  = args.data;
+
+        if (args.lastIncludedIndex > commitIndex_.load())
+            commitIndex_.store(args.lastIncludedIndex);
+        if (args.lastIncludedIndex > lastApplied_.load())
+            lastApplied_.store(args.lastIncludedIndex);
+
+        // 持久化
+        if (storage_) {
+            storage_->saveSnapshot(snapshotIndex_, snapshotTerm_, snapshotData_);
+            persistLog();
+            persistHardState();
+        }
+
         done(json(reply).dump());
     });
 }
@@ -230,6 +353,7 @@ void RaftNode::becomeFollower(uint64_t term) {
     state_.store(State::Follower);
     currentTerm_.store(term);
     votedFor_ = -1;
+    persistHardState();  // term 变化必须立即落盘
     resetElectionTimer();
 }
 
@@ -242,6 +366,7 @@ void RaftNode::becomeCandidate() {
     votedFor_             = id_;  // 候选人给自己投一票（Raft 允许自投）
     currentElectionVotes_ = 1;    // 票数从 1 开始（已含自己那票）
     LOG_INFO << "[Node " << id_ << "] 选举超时 → 候选人，任期=" << currentTerm_.load();
+    persistHardState();  // term++ 和 votedFor=self 必须同步落盘
     // 重置选举计时器：如果这一轮在随机超时内没选出 Leader（平票/网络分区），
     // 计时器到期后会自动发起下一轮选举（term 再递增）。随机超时使平票概率极低。
     resetElectionTimer();
@@ -387,8 +512,16 @@ FireAndForget RaftNode::replicateLog(Peer peer) {
     uint64_t ni = nextIndex_.count(peer.id) ? nextIndex_[peer.id] : lastLogIndex() + 1;
     if (ni < 1) ni = 1; // 安全下限（哨兵条目不发送）
 
+    // Day34：若 peer 需要的条目已被快照压缩，改发 InstallSnapshot
+    if (ni <= snapshotIndex_) {
+        sendInstallSnapshot(peer);
+        co_return;
+    }
+
     uint64_t prevIdx  = ni - 1;
-    uint64_t prevTerm = (prevIdx < log_.size()) ? log_[prevIdx].term : 0;
+    // prevIdx 一定 >= snapshotIndex_（上面已保证 ni > snapshotIndex_），
+    // logAt(prevIdx) 安全访问 log_[prevIdx - snapshotIndex_]
+    uint64_t prevTerm = logAt(prevIdx).term;
 
     // 构造 AppendEntriesArgs：收集 [ni, lastLogIndex] 范围的条目
     AppendEntriesArgs args;
@@ -398,7 +531,7 @@ FireAndForget RaftNode::replicateLog(Peer peer) {
     args.prevLogTerm  = prevTerm;
     args.leaderCommit = commitIndex_.load();
     for (uint64_t i = ni; i <= lastLogIndex(); ++i)
-        args.entries.push_back(log_[i]);
+        args.entries.push_back(logAt(i));
 
     // ── 挂起点：发出 AppendEntries RPC ──────────────────────────────────
     auto [ok, respJson] = co_await getOrCreateClient(peer)->callAsyncCo(
@@ -442,14 +575,52 @@ FireAndForget RaftNode::replicateLog(Peer peer) {
         } else {
             // 在 Leader 日志里找 conflictTerm 的最后一条
             int64_t found = -1;
-            for (int64_t i = (int64_t)lastLogIndex(); i >= 1; --i) {
-                if (log_[i].term == reply.conflictTerm) { found = i + 1; break; }
+            for (int64_t i = (int64_t)lastLogIndex(); i > (int64_t)snapshotIndex_; --i) {
+                if (logAt(i).term == reply.conflictTerm) { found = i + 1; break; }
             }
             newNext = (found >= 0) ? (uint64_t)found : reply.conflictIndex;
         }
         // 只允许减小 nextIndex（不能因为并发成功回包而增大）
         if (newNext < nextIndex_[peer.id])
             nextIndex_[peer.id] = std::max(newNext, uint64_t{1});
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §5b  快照传输协程：sendInstallSnapshot
+//
+// 当 Follower 需要的 nextIndex 已被快照压缩时，从 replicateLog 跳转到此协程。
+// 发完快照后更新 matchIndex/nextIndex，后续可继续用 AppendEntries 追赶。
+// ════════════════════════════════════════════════════════════════════════════
+
+FireAndForget RaftNode::sendInstallSnapshot(Peer peer) {
+    if (state_.load() != State::Leader || snapshotIndex_ == 0) co_return;
+
+    InstallSnapshotArgs args;
+    args.term              = currentTerm_.load();
+    args.leaderId          = id_;
+    args.lastIncludedIndex = snapshotIndex_;
+    args.lastIncludedTerm  = snapshotTerm_;
+    args.data              = snapshotData_;
+
+    LOG_INFO << "[Node " << id_ << "] 向节点 " << peer.id
+             << " 发送快照 lastIndex=" << args.lastIncludedIndex;
+
+    auto [ok, respJson] = co_await getOrCreateClient(peer)->callAsyncCo(
+        "InstallSnapshot", json(args).dump(), /*timeoutMs=*/1000);
+
+    if (!ok || state_.load() != State::Leader) co_return;
+
+    InstallSnapshotReply reply{};
+    try { reply = json::parse(respJson).get<InstallSnapshotReply>(); }
+    catch (...) { co_return; }
+
+    if (reply.term > currentTerm_.load()) { becomeFollower(reply.term); co_return; }
+
+    // 快照安装成功：把 peer 的 matchIndex 推到快照点，nextIndex 推到快照点之后
+    if (snapshotIndex_ > matchIndex_[peer.id]) {
+        matchIndex_[peer.id] = snapshotIndex_;
+        nextIndex_[peer.id]  = snapshotIndex_ + 1;
     }
 }
 
@@ -463,7 +634,8 @@ void RaftNode::advanceCommitIndex() {
     // 若允许提交旧 term 条目，会破坏安全性（参见 Raft 论文 Figure 8 的反例）。
     uint64_t lastIdx = lastLogIndex();
     for (uint64_t n = lastIdx; n > commitIndex_.load(); --n) {
-        if (log_[n].term != currentTerm_.load()) continue; // Figure 8 过滤
+        if (n <= snapshotIndex_) break;              // 快照点之前已通过快照提交
+        if (logAt(n).term != currentTerm_.load()) continue; // Figure 8 过滤
         int count = 1; // 算上自己
         for (const auto &peer : peers_) {
             if (peer.id == id_) continue;
@@ -472,7 +644,7 @@ void RaftNode::advanceCommitIndex() {
         if (count >= quorum_) {
             commitIndex_.store(n);
             LOG_INFO << "[Node " << id_ << "] 提交进度推进到 index=" << n
-                     << "（任期=" << log_[n].term << " 命令=" << log_[n].cmd << ")";
+                     << "（任期=" << logAt(n).term << " 命令=" << logAt(n).cmd << ")";
             applyCommitted();
             break; // 找到最大可提交 N 后即停（更小的 n 在下轮自然覆盖）
         }
@@ -484,11 +656,11 @@ void RaftNode::applyCommitted() {
     // applyCallback_ 在 loop_ 线程回调 → 状态机代码天然单线程，无需加锁。
     while (lastApplied_.load() < commitIndex_.load()) {
         uint64_t idx = lastApplied_.load() + 1;
-        if (idx >= log_.size()) break; // 防御：不应发生
+        if (idx > lastLogIndex()) break; // 防御：不应发生
         lastApplied_.store(idx);
         LOG_INFO << "[Node " << id_ << "] 应用日志 index=" << idx
-                 << " 命令=" << log_[idx].cmd;
-        if (applyCallback_) applyCallback_(idx, log_[idx].cmd);
+                 << " 命令=" << logAt(idx).cmd;
+        if (applyCallback_) applyCallback_(idx, logAt(idx).cmd);
     }
 }
 
@@ -507,6 +679,7 @@ void RaftNode::propose(const std::string &cmd) {
         }
         // 追加到本地日志（Leader 自己的那份），term = currentTerm
         log_.push_back(LogEntry{currentTerm_.load(), cmd});
+        persistLog();  // Leader 本地追加后立即落盘，崩溃不丢已接受的命令
         LOG_INFO << "[Node " << id_ << "] 追加日志条目 index=" << lastLogIndex()
                  << " 命令=" << cmd;
         // 立刻触发一轮复制（不等下一个 50ms heartbeat 周期）
@@ -517,7 +690,67 @@ void RaftNode::propose(const std::string &cmd) {
     });
 }
 
-uint64_t RaftNode::lastLogIndex() const { return static_cast<uint64_t>(log_.size() - 1); }
+uint64_t RaftNode::lastLogIndex() const {
+    return snapshotIndex_ + static_cast<uint64_t>(log_.size()) - 1;
+}
 uint64_t RaftNode::lastLogTerm() const { return log_.back().term; }
+
+LogEntry &RaftNode::logAt(uint64_t idx) {
+    return log_[idx - snapshotIndex_];
+}
+const LogEntry &RaftNode::logAt(uint64_t idx) const {
+    return log_[idx - snapshotIndex_];
+}
+
+void RaftNode::persistHardState() {
+    if (!storage_) return;
+    storage_->saveHardState({currentTerm_.load(), votedFor_});
+}
+
+void RaftNode::persistLog() {
+    if (!storage_) return;
+    // log_[0] 是哨兵，不持久化；存储的是 snapshotIndex_+1 之后的真实条目
+    storage_->saveLog(std::vector<LogEntry>(log_.begin() + 1, log_.end()));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §7b  日志压缩：takeSnapshot
+//
+// 由上层状态机调用（通常在 apply 达到某阈值时触发）。
+// 将 [0, lastApplied_] 范围的日志条目压缩为一个快照，
+// 压缩后 log_ 只保留快照点之后的条目，大幅减少内存占用和重启恢复时间。
+// ════════════════════════════════════════════════════════════════════════════
+
+void RaftNode::takeSnapshot(const std::string &data) {
+    loop_.runInLoop([this, data] {
+        uint64_t snapIdx = lastApplied_.load();
+        if (snapIdx <= snapshotIndex_) return; // 没有新的 apply，无需压缩
+
+        uint64_t snapTerm = logAt(snapIdx).term;
+
+        // 保留快照点之后的条目（以免丢弃已复制但未提交的新条目）
+        uint64_t keepFrom = snapIdx - snapshotIndex_ + 1; // 局部下标
+        std::vector<LogEntry> keep;
+        if (keepFrom < log_.size())
+            keep = std::vector<LogEntry>(log_.begin() + keepFrom, log_.end());
+
+        // 重建 log_：新哨兵 + 保留条目
+        log_.clear();
+        log_.push_back(LogEntry{snapTerm, ""});
+        log_.insert(log_.end(), keep.begin(), keep.end());
+
+        snapshotIndex_ = snapIdx;
+        snapshotTerm_  = snapTerm;
+        snapshotData_  = data;
+
+        LOG_INFO << "[Node " << id_ << "] 创建快照 snapshotIndex=" << snapshotIndex_
+                 << " 压缩后剩余=" << (log_.size() - 1) << " 条";
+
+        if (storage_) {
+            storage_->saveSnapshot(snapshotIndex_, snapshotTerm_, snapshotData_);
+            persistLog();
+        }
+    });
+}
 
 } // namespace raft

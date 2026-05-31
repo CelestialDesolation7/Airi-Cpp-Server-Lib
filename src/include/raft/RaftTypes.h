@@ -57,11 +57,30 @@ struct AppendEntriesReply {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AppendEntriesReply, term, success, conflictIndex, conflictTerm)
 
+// InstallSnapshot：Leader 把完整状态机快照发给严重落后的 Follower。
+// 触发条件：Follower 需要的 nextIndex 已被 Leader 的快照压缩（不在 log_ 中），
+//   此时无法用 AppendEntries 补齐，必须先用快照把 Follower 的状态机拉到快照点，
+//   再继续用 AppendEntries 追赶快照点之后的条目。
+struct InstallSnapshotArgs {
+    uint64_t    term{0};
+    int         leaderId{-1};
+    uint64_t    lastIncludedIndex{0};  // 快照覆盖到的最后一条日志 index
+    uint64_t    lastIncludedTerm{0};   // 该条日志的 term（用于重置哨兵）
+    std::string data;                  // 状态机快照，由上层序列化，Raft 透明传输
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InstallSnapshotArgs,
+    term, leaderId, lastIncludedIndex, lastIncludedTerm, data)
+
+struct InstallSnapshotReply {
+    uint64_t term{0};  // Follower 当前 term，供 Leader 检测僵尸状态
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InstallSnapshotReply, term)
+
 inline const char* stateName(State s) {
     switch (s) {
-        case State::Follower:  return "跟随者";
-        case State::Candidate: return "候选人";
-        case State::Leader:    return "领导者";
+        case State::Follower:  return "Follower";
+        case State::Candidate: return "Candidate";
+        case State::Leader:    return "Leader";
     }
     return "?";
 }
