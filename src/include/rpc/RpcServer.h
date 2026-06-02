@@ -28,8 +28,13 @@
 //
 class RpcServer {
   public:
-    using Done    = std::function<void(std::string responseJson)>;
-    using Handler = std::function<void(const std::string &req, Done done)>;
+    using Done    = std::function<void(std::string responsePayload)>;
+    // Handler 新增 bypass 参数：携带 AppendEntries 中的原始 value 字节。
+    // 对于不使用 bypass 的 RPC（RequestVote/InstallSnapshot/NodeAnnounce），
+    // bypass 始终为空字符串，忽略即可。
+    using Handler = std::function<void(const std::string &payload,
+                                       const std::string &bypass,
+                                       Done done)>;
 
     RpcServer(const std::string &ip, uint16_t port, int ioThreads = 1);
 

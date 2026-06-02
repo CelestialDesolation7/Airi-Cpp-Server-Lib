@@ -50,20 +50,27 @@ class Channel;
 
 class AsyncRpcClient {
   public:
-    using Callback = std::function<void(bool ok, std::string responseJson)>;
+    using Callback = std::function<void(bool ok, std::string responsePayload)>;
 
     AsyncRpcClient(Eventloop *loop, std::string ip, uint16_t port);
     ~AsyncRpcClient();
 
     // 任意线程调用；callback 在 loop_ 线程触发。
-    void callAsync(const std::string &method, const std::string &requestJson, Callback cb,
-                   int timeoutMs = 200);
+    // bypass: 旁路透传的原始 value 字节（对于不需要旁路的 RPC传入空字符串）。
+    void callAsync(const std::string &method, const std::string &payload,
+                   const std::string &bypass, Callback cb, int timeoutMs = 200);
+
+    // 外部通知：对端已重新上线，立刻清除退避并触发重连。
+    // 典型场景：收到对端的 NodeAnnounce 广播后调用，使 Leader 立即重建连接，
+    // 不必等待指数退避期自然到期（最长可累积到数秒甚至数十秒）。
+    // 可从任意线程调用；实际操作切回 loop_ 线程执行，线程安全。
+    void wakeUp();
 
     // 协程版：在 FireAndForget 协程内使用。
-    //   auto [ok, resp] = co_await client->callAsyncCo("method", json, timeoutMs);
-    // 语义与 callAsync 完全一致；返回值通过 co_await 表达式解构。
-    // 返回类型 RpcCallAwaiter 定义在本文件末尾（避免前向声明）。
-    class RpcCallAwaiter callAsyncCo(const std::string &method, const std::string &requestJson,
+    //   auto [ok, resp] = co_await client->callAsyncCo("method", payload, bypass, timeoutMs);
+    // bypass 默认为空字符串（大多数 RPC 不需要旁路）。
+    class RpcCallAwaiter callAsyncCo(const std::string &method, const std::string &payload,
+                                     const std::string &bypass = {},
                                      int timeoutMs = 200);
 
     // 主动关闭：取消所有 pending 并关闭长连接。stop 后 callAsync 立刻以 ok=false 回调。
@@ -78,8 +85,8 @@ class AsyncRpcClient {
     };
 
     // —— 以下函数全部只在 loop_ 线程执行 ——
-    void doCall(const std::string &method, const std::string &requestJson, Callback cb,
-                int timeoutMs);
+    void doCall(const std::string &method, const std::string &payload,
+                const std::string &bypass, Callback cb, int timeoutMs);
     void startConnectLocked();
     void onConnectWritable(int fd, uint64_t connEpoch);
     void onConnected(int fd);
@@ -97,7 +104,7 @@ class AsyncRpcClient {
 
     // 指数退避（初始 500ms，每次翻倍，上限 30s；仅第一次连续失败打 WARN）
     struct ConnectBackoff {
-        static constexpr int64_t kInitMs = 500;
+        static constexpr int64_t kInitMs = 100;   // 首次失败后 100ms 重试（原 500ms，LAN 场景过于保守）
         static constexpr int64_t kMaxMs  = 30'000;
         int64_t untilMs_   {0};
         int64_t durationMs_{0};
@@ -149,10 +156,12 @@ class AsyncRpcClient {
 //
 class RpcCallAwaiter {
   public:
-    RpcCallAwaiter(AsyncRpcClient *client, std::string method, std::string json, int timeoutMs)
+    RpcCallAwaiter(AsyncRpcClient *client, std::string method,
+                   std::string payload, std::string bypass, int timeoutMs)
         : client_(client),
           method_(std::move(method)),
-          json_(std::move(json)),
+          payload_(std::move(payload)),
+          bypass_(std::move(bypass)),
           timeoutMs_(timeoutMs) {}
 
     bool await_ready() const noexcept { return false; }
@@ -166,7 +175,8 @@ class RpcCallAwaiter {
   private:
     AsyncRpcClient *client_;
     std::string     method_;
-    std::string     json_;
+    std::string     payload_;  // Protobuf-encoded body
+    std::string     bypass_;   // 旁路 value 字节
     int             timeoutMs_;
     bool            ok_{false};
     std::string     resp_;

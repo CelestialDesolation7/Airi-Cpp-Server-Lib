@@ -147,8 +147,12 @@ int main(int argc, char **argv) {
     node.setApplyCallback([&node, &sm, myId, snapshotEvery, &applyCount](
                               uint64_t index, const std::string &cmd) {
         sm.apply(index, cmd);
-        if (snapshotEvery > 0 && ++applyCount % snapshotEvery == 0)
-            node.takeSnapshot(sm.serialize());
+        if (snapshotEvery > 0 && ++applyCount % snapshotEvery == 0) {
+            // 必须把 index 与 sm.serialize() 一起传进去：takeSnapshot lambda
+            // 是异步排队执行的，lambda 内部不能再用 lastApplied_ 推断快照点，
+            // 否则会与 data 表征的状态时刻错位（参见 RaftNode::takeSnapshot 注释）。
+            node.takeSnapshot(index, sm.serialize());
+        }
     });
 
     node.setSnapshotApplyCallback([&sm](uint64_t index, const std::string &data) {
@@ -217,6 +221,26 @@ int main(int argc, char **argv) {
 
     kvSrv.stop();
     httpThread.join();
+
+    // ── 优雅停机：若本节点是 Leader，先主动让贤再 stop，避免选主写空窗 ─────
+    if (node.isLeader()) {
+        std::cout << C_YELLOW "[Node " << myId
+                  << "] 检测到自身是 Leader，发起主动 Leader Transfer..." C_RESET "\n";
+        if (node.transferLeadership(/*auto-pick*/ -1)) {
+            // 等待最多 800ms 让 target 接任并广播心跳，本节点 becomeFollower
+            for (int i = 0; i < 80; ++i) {
+                if (!node.isLeader()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            std::cout << C_GRAY "[Node " << myId
+                      << "] 让贤完成（或超时），当前 leaderId="
+                      << node.getLeaderId() << C_RESET "\n";
+        } else {
+            std::cout << C_GRAY "[Node " << myId
+                      << "] Leader Transfer 未发起（单节点或无可用目标）" C_RESET "\n";
+        }
+    }
+
     node.stop();
     std::cout << C_GRAY "[Node " << myId << "] 已退出" C_RESET "\n";
     return 0;

@@ -4,20 +4,197 @@
 //   §1 构造 / 析构 / start / stop      —— 线程编排与生命周期（含持久化恢复）
 //   §2 RPC server 回调（fire-and-forget）—— AppendEntries / InstallSnapshot
 //   §3 角色切换 + 选举定时器           —— 全部在 loop_ 线程，无锁
-//   §4 选举：runElection + collectVote 协程
+//   §4 选举：Pre-Vote → runElection + collectVote 协程
 //   §5 日志复制 + 心跳：heartbeatTick + replicateLog + sendInstallSnapshot 协程
 //   §6 提交推进：advanceCommitIndex + applyCommitted
-//   §7 外部写入接口：propose + takeSnapshot
+//   §7 外部写入/读取接口：propose + proposeRead + takeSnapshot
 //   §8 辅助：lastLogIndex / lastLogTerm / logAt / persistHardState / persistLog
 //
 #include "raft/RaftNode.h"
 #include "log/Logger.h"
 #include <chrono>
-#include <nlohmann/json.hpp>
-
-using nlohmann::json;
+// Protobuf 生成的 Raft RPC 消息类型（cmake protobuf_generate_cpp 输出到 build/）
+#include "raft.pb.h"
 
 namespace raft {
+
+// ── Protobuf 序列化辅助 + Value 旁路透传拆分 ──────────────────────────────
+// 替换旧的 mpEncode/mpDecode（json → msgpack），使用 Protobuf 编解码。
+// AppendEntries 特别处理：cmd 中 value 部分通过 bypass 字段旁路透传，
+// 避免 value 字节经过 Protobuf 序列化（节省 2~4 次 value 拷贝）。
+namespace {
+
+// ── 命令分割 / 重组（AppendEntries bypass 旁路透传核心）─────────────────
+// splitCmd("PUT mykey value_bytes") → {"PUT mykey", "value_bytes"}
+// splitCmd("DEL mykey")             → {"DEL mykey", ""}
+// splitCmd("")                      → {"", ""}  （no-op 条目）
+static std::pair<std::string, std::string> splitCmd(const std::string &cmd) {
+    if (cmd.empty()) return {"", ""};
+    size_t sp1 = cmd.find(' ');
+    if (sp1 == std::string::npos) return {cmd, ""};
+    size_t sp2 = cmd.find(' ', sp1 + 1);
+    if (sp2 == std::string::npos) return {cmd, ""};  // DEL/no-op 无 value
+    return {cmd.substr(0, sp2), cmd.substr(sp2 + 1)};
+}
+// joinCmd("PUT mykey", "value_bytes") → "PUT mykey value_bytes"
+// joinCmd("DEL mykey", "")            → "DEL mykey"
+static std::string joinCmd(const std::string &hdr, const std::string &val) {
+    if (val.empty()) return hdr;
+    return hdr + " " + val;
+}
+
+// ── RequestVote ────────────────────────────────────────────────────────────
+static std::string encodeRV(const RequestVoteArgs &a) {
+    raft_proto::RequestVoteReq pb;
+    pb.set_term(a.term);
+    pb.set_candidate_id(a.candidateId);
+    pb.set_last_log_index(a.lastLogIndex);
+    pb.set_last_log_term(a.lastLogTerm);
+    pb.set_pre_vote(a.preVote);
+    std::string s; pb.SerializeToString(&s); return s;
+}
+static RequestVoteArgs decodeRV(const std::string &s) {
+    raft_proto::RequestVoteReq pb; pb.ParseFromString(s);
+    return {static_cast<uint64_t>(pb.term()), static_cast<int>(pb.candidate_id()),
+            static_cast<uint64_t>(pb.last_log_index()),
+            static_cast<uint64_t>(pb.last_log_term()), pb.pre_vote()};
+}
+static std::string encodeRVRep(const RequestVoteReply &r) {
+    raft_proto::RequestVoteRep pb;
+    pb.set_term(r.term); pb.set_vote_granted(r.voteGranted);
+    std::string s; pb.SerializeToString(&s); return s;
+}
+static RequestVoteReply decodeRVRep(const std::string &s) {
+    raft_proto::RequestVoteRep pb; pb.ParseFromString(s);
+    return {static_cast<uint64_t>(pb.term()), pb.vote_granted()};
+}
+
+// ── AppendEntries（含 bypass 旁路透传）────────────────────────────────────
+// 返回 {proto_bytes, bypass_bytes}：
+//   proto_bytes  = Protobuf 编码的元数据（term/index/条目 cmd_header/vlen）
+//   bypass_bytes = 所有条目 value 字节顺序拼接（不经过任何序列化）
+static std::pair<std::string, std::string> encodeAE(const AppendEntriesArgs &a) {
+    raft_proto::AppendEntriesReq pb;
+    pb.set_term(a.term);
+    pb.set_leader_id(a.leaderId);
+    pb.set_prev_idx(a.prevLogIndex);
+    pb.set_prev_term(a.prevLogTerm);
+    pb.set_commit(a.leaderCommit);
+    std::string bypass;
+    for (const auto &e : a.entries) {
+        auto *ep = pb.add_entries();
+        ep->set_term(e.term);
+        auto [hdr, val] = splitCmd(e.cmd);
+        ep->set_cmd(hdr);
+        ep->set_vlen(static_cast<uint32_t>(val.size()));
+        bypass += val;  // 将 value 追加到 bypass（零序列化）
+    }
+    std::string proto_bytes; pb.SerializeToString(&proto_bytes);
+    return {proto_bytes, bypass};
+}
+static AppendEntriesArgs decodeAE(const std::string &proto_bytes,
+                                   const std::string &bypass) {
+    raft_proto::AppendEntriesReq pb; pb.ParseFromString(proto_bytes);
+    AppendEntriesArgs a;
+    a.term         = pb.term();
+    a.leaderId     = pb.leader_id();
+    a.prevLogIndex = pb.prev_idx();
+    a.prevLogTerm  = pb.prev_term();
+    a.leaderCommit = pb.commit();
+    size_t offset = 0;
+    for (const auto &ep : pb.entries()) {
+        LogEntry le;
+        le.term        = ep.term();
+        std::string val = bypass.substr(offset, ep.vlen());
+        offset += ep.vlen();
+        le.cmd = joinCmd(std::string(ep.cmd()), val);
+        a.entries.push_back(std::move(le));
+    }
+    return a;
+}
+static std::string encodeAERep(const AppendEntriesReply &r) {
+    raft_proto::AppendEntriesRep pb;
+    pb.set_term(r.term); pb.set_success(r.success);
+    pb.set_conflict_index(r.conflictIndex); pb.set_conflict_term(r.conflictTerm);
+    std::string s; pb.SerializeToString(&s); return s;
+}
+static AppendEntriesReply decodeAERep(const std::string &s) {
+    raft_proto::AppendEntriesRep pb; pb.ParseFromString(s);
+    return {static_cast<uint64_t>(pb.term()), pb.success(),
+            static_cast<uint64_t>(pb.conflict_index()),
+            static_cast<uint64_t>(pb.conflict_term())};
+}
+
+// ── InstallSnapshot ────────────────────────────────────────────────────────
+static std::string encodeIS(const InstallSnapshotArgs &a) {
+    raft_proto::InstallSnapshotReq pb;
+    pb.set_term(a.term); pb.set_leader_id(a.leaderId);
+    pb.set_last_included_index(a.lastIncludedIndex);
+    pb.set_last_included_term(a.lastIncludedTerm);
+    pb.set_data(a.data);
+    std::string s; pb.SerializeToString(&s); return s;
+}
+static InstallSnapshotArgs decodeIS(const std::string &s) {
+    raft_proto::InstallSnapshotReq pb; pb.ParseFromString(s);
+    InstallSnapshotArgs a;
+    a.term               = pb.term();
+    a.leaderId           = pb.leader_id();
+    a.lastIncludedIndex  = pb.last_included_index();
+    a.lastIncludedTerm   = pb.last_included_term();
+    a.data               = pb.data();
+    return a;
+}
+static std::string encodeISRep(const InstallSnapshotReply &r) {
+    raft_proto::InstallSnapshotRep pb; pb.set_term(r.term);
+    std::string s; pb.SerializeToString(&s); return s;
+}
+static InstallSnapshotReply decodeISRep(const std::string &s) {
+    raft_proto::InstallSnapshotRep pb; pb.ParseFromString(s);
+    return {static_cast<uint64_t>(pb.term())};
+}
+
+// ── Follower ReadIndex ────────────────────────────────────────────────────
+static std::string encodeReadIndexReq(uint64_t followerId, uint64_t requestId) {
+    raft_proto::ReadIndexReq pb;
+    pb.set_follower_id(followerId);
+    pb.set_request_id(requestId);
+    std::string s; pb.SerializeToString(&s); return s;
+}
+static std::pair<uint64_t, uint64_t> decodeReadIndexReq(const std::string &s) {
+    raft_proto::ReadIndexReq pb; pb.ParseFromString(s);
+    return {static_cast<uint64_t>(pb.follower_id()),
+            static_cast<uint64_t>(pb.request_id())};
+}
+static std::string encodeReadIndexResp(uint64_t requestId, uint64_t readIndex, bool ok) {
+    raft_proto::ReadIndexResp pb;
+    pb.set_request_id(requestId);
+    pb.set_read_index(readIndex);
+    pb.set_ok(ok);
+    std::string s; pb.SerializeToString(&s); return s;
+}
+static std::tuple<uint64_t, uint64_t, bool> decodeReadIndexResp(const std::string &s) {
+    raft_proto::ReadIndexResp pb; pb.ParseFromString(s);
+    return {static_cast<uint64_t>(pb.request_id()),
+            static_cast<uint64_t>(pb.read_index()),
+            pb.ok()};
+}
+
+// ── TimeoutNow（Leader Transfer）─────────────────────────────────────────
+static std::string encodeTimeoutNowReq(uint64_t term) {
+    raft_proto::TimeoutNowReq pb; pb.set_term(term);
+    std::string s; pb.SerializeToString(&s); return s;
+}
+static uint64_t decodeTimeoutNowReq(const std::string &s) {
+    raft_proto::TimeoutNowReq pb; pb.ParseFromString(s);
+    return static_cast<uint64_t>(pb.term());
+}
+static std::string encodeTimeoutNowResp(uint64_t term, bool ok) {
+    raft_proto::TimeoutNowResp pb;
+    pb.set_term(term); pb.set_ok(ok);
+    std::string s; pb.SerializeToString(&s); return s;
+}
+
+} // namespace
 
 // ════════════════════════════════════════════════════════════════════════════
 // §1  构造 / 析构 / start / stop
@@ -36,25 +213,36 @@ RaftNode::RaftNode(int id, std::vector<Peer> peers, uint16_t rpcPort)
     log_.push_back(LogEntry{0, ""});
 
     // 注册异步 handler：handler 立刻 return，由 done 异步回写响应
+    // 新签名：handler(payload, bypass, done)
     rpcServer_.addHandler(
         "RequestVote",
-        [this](const std::string &req, RpcServer::Done done) {
-            handleRequestVote(req, std::move(done));
+        [this](const std::string &payload, const std::string &bypass, RpcServer::Done done) {
+            handleRequestVote(payload, bypass, std::move(done));
         });
     rpcServer_.addHandler(
         "AppendEntries",
-        [this](const std::string &req, RpcServer::Done done) {
-            handleAppendEntries(req, std::move(done));
+        [this](const std::string &payload, const std::string &bypass, RpcServer::Done done) {
+            handleAppendEntries(payload, bypass, std::move(done));
         });
     rpcServer_.addHandler(
         "InstallSnapshot",
-        [this](const std::string &req, RpcServer::Done done) {
-            handleInstallSnapshot(req, std::move(done));
+        [this](const std::string &payload, const std::string &bypass, RpcServer::Done done) {
+            handleInstallSnapshot(payload, bypass, std::move(done));
         });
     rpcServer_.addHandler(
         "NodeAnnounce",
-        [this](const std::string &req, RpcServer::Done done) {
-            handleNodeAnnounce(req, std::move(done));
+        [this](const std::string &payload, const std::string &bypass, RpcServer::Done done) {
+            handleNodeAnnounce(payload, bypass, std::move(done));
+        });
+    rpcServer_.addHandler(
+        "ReadIndex",
+        [this](const std::string &payload, const std::string &bypass, RpcServer::Done done) {
+            handleReadIndex(payload, bypass, std::move(done));
+        });
+    rpcServer_.addHandler(
+        "TimeoutNow",
+        [this](const std::string &payload, const std::string &bypass, RpcServer::Done done) {
+            handleTimeoutNow(payload, bypass, std::move(done));
         });
 }
 
@@ -114,15 +302,14 @@ void RaftNode::start() {
 
             resetElectionTimer();
             // 上线广播：100ms 后向所有 peer 发 NodeAnnounce。
-            // 各 peer 收到后立即重置对本节点的连接退避时钟并尝试重连，
-            // 彻底消除"指数退避累积过长导致 Leader 迟迟无法发心跳"的问题。
-            // 100ms 延迟足以让 rpcServerThread_ 启动其 EventLoop 并开始 accept。
             loop_.runAfter(0.1, [this] {
-                std::string body = json{{"nodeId", id_}}.dump();
+                raft_proto::NodeAnnounceReq pb;
+                pb.set_node_id(id_);
+                std::string body; pb.SerializeToString(&body);
                 for (const auto &peer : peers_) {
                     if (peer.id == id_) continue;
                     getOrCreateClient(peer)->callAsync(
-                        "NodeAnnounce", body,
+                        "NodeAnnounce", body, /*bypass=*/{},
                         [id = id_, peerId = peer.id](bool ok, const std::string &) {
                             if (ok)
                                 LOG_INFO << "[Node " << id << "] NodeAnnounce → Node "
@@ -185,16 +372,29 @@ void RaftNode::stop() {
 // 永远不会被同步阻塞，单 IO 线程也能处理任意并发的 inbound RPC。
 // ════════════════════════════════════════════════════════════════════════════
 
-void RaftNode::handleRequestVote(const std::string &reqJson, RpcServer::Done done) {
+void RaftNode::handleRequestVote(const std::string &payload, const std::string & /*bypass*/,
+                                  RpcServer::Done done) {
     RequestVoteArgs args;
     try {
-        args = json::parse(reqJson).get<RequestVoteArgs>();
+        args = decodeRV(payload);
     } catch (...) {
-        done(R"({"term":0,"voteGranted":false})");
+        done(encodeRVRep({0, false}));
         return;
     }
 
     loop_.runInLoop([this, args, done = std::move(done)]() mutable {
+        // ── Pre-vote 路径：不修改任何持久化状态 ──────────────────────────
+        // 候选人询问"若我以 args.term 发起真实选举，你会投我吗？"
+        // 判断标准与真实投票相同，但不更新 term/votedFor，不落盘，不重置选举计时器。
+        if (args.preVote) {
+            bool eligible = (args.term >= currentTerm_.load()) &&
+                            (args.lastLogTerm > lastLogTerm() ||
+                             (args.lastLogTerm == lastLogTerm() && args.lastLogIndex >= lastLogIndex()));
+            done(encodeRVRep({currentTerm_.load(), eligible}));
+            return;
+        }
+
+        // ── 真实投票路径 ─────────────────────────────────────────────────
         // 【Raft 规则 §5.1】任何 RPC 只要携带更高 term，接收方必须立刻退回 Follower。
         // 这保证了任期单调递增——旧 Leader 看到新 term 后不再自以为是 Leader。
         if (args.term > currentTerm_.load()) becomeFollower(args.term);
@@ -219,27 +419,25 @@ void RaftNode::handleRequestVote(const std::string &reqJson, RpcServer::Done don
              (args.lastLogTerm == lastLogTerm() && args.lastLogIndex >= lastLogIndex()))
         ) {
             grant     = true;
-            votedFor_ = args.candidateId;  // 记录投票，本 term 内不再投给其他人
-            // 收到合法投票请求后重置自己的选举计时器：
-            // 既然已经有候选人在运作，就不要再发起竞争选举，让它先跑完。
-            startupGrace_ = false;  // 集群中已有候选人在动，退出启动宽限期
+            votedFor_ = args.candidateId;
+            startupGrace_ = false;
             resetElectionTimer();
             persistHardState();  // votedFor 变化必须立即落盘
             LOG_INFO << "[Node " << id_ << "] 已投票给节点 " << args.candidateId
                      << "，term=" << args.term;
         }
 
-        RequestVoteReply reply{currentTerm_.load(), grant};
-        done(json(reply).dump());
+        done(encodeRVRep({currentTerm_.load(), grant}));
     });
 }
 
-void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done done) {
+void RaftNode::handleAppendEntries(const std::string &payload, const std::string &bypass,
+                                    RpcServer::Done done) {
     AppendEntriesArgs args;
     try {
-        args = json::parse(reqJson).get<AppendEntriesArgs>();
+        args = decodeAE(payload, bypass);
     } catch (...) {
-        done(R"({"term":0,"success":false,"conflictIndex":0,"conflictTerm":0})");
+        done(encodeAERep({0, false, 0, 0}));
         return;
     }
 
@@ -250,7 +448,7 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
 
         // 规则①：过时 term 的 RPC 直接拒绝（发送方是旧 Leader，已被淘汰）
         if (args.term < currentTerm_.load()) {
-            done(json(reply).dump());
+            done(encodeAERep(reply));
             return;
         }
 
@@ -271,12 +469,10 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
         // 但 index > snapshotIndex_ 的部分仍需正常追加，否则 follower 状态机
         // 会永久落后这批 entries（leader 误以为成功后不再重传这部分）。
         if (args.prevLogIndex < snapshotIndex_) {
-            // 将 prevLogIndex 推到 snapshotIndex_，对应裁掉 entries 前缀
             uint64_t skipN = snapshotIndex_ - args.prevLogIndex;
             if (skipN >= args.entries.size()) {
-                // entries 全部已被快照覆盖，无需追加；仍然 ack 让 leader 推进 nextIndex
                 reply.success = true;
-                done(json(reply).dump());
+                done(encodeAERep(reply));
                 return;
             }
             args.entries.erase(args.entries.begin(),
@@ -286,10 +482,9 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
             // 继续走下面的正常追加 + commit 推进流程
         }
         if (args.prevLogIndex > lastLogIndex()) {
-            // Follower 日志太短，根本没有 prevLogIndex 处的条目
-            reply.conflictIndex = lastLogIndex() + 1;  // 告知 Leader 从这里开始重发
-            reply.conflictTerm  = 0;                   // 0 = 该位置不存在
-            done(json(reply).dump());
+            reply.conflictIndex = lastLogIndex() + 1;
+            reply.conflictTerm  = 0;
+            done(encodeAERep(reply));
             return;
         }
         if (logAt(args.prevLogIndex).term != args.prevLogTerm) {
@@ -301,7 +496,7 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
             while (ci > snapshotIndex_ && logAt(ci - 1).term == ct) --ci;
             reply.conflictIndex = ci;
             reply.conflictTerm  = ct;
-            done(json(reply).dump());
+            done(encodeAERep(reply));
             return;
         }
 
@@ -332,10 +527,9 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
         }
 
         reply.success = true;
-        done(json(reply).dump());
+        done(encodeAERep(reply));
     });
 }
-
 // ════════════════════════════════════════════════════════════════════════════
 // §2b  InstallSnapshot handler
 //
@@ -344,12 +538,13 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
 // 并更新 commitIndex/lastApplied 到快照点（无需逐条 apply）。
 // ════════════════════════════════════════════════════════════════════════════
 
-void RaftNode::handleInstallSnapshot(const std::string &reqJson, RpcServer::Done done) {
+void RaftNode::handleInstallSnapshot(const std::string &payload, const std::string & /*bypass*/,
+                                      RpcServer::Done done) {
     InstallSnapshotArgs args;
     try {
-        args = json::parse(reqJson).get<InstallSnapshotArgs>();
+        args = decodeIS(payload);
     } catch (...) {
-        done(R"({"term":0})");
+        done(encodeISRep({0}));
         return;
     }
 
@@ -358,7 +553,7 @@ void RaftNode::handleInstallSnapshot(const std::string &reqJson, RpcServer::Done
 
         InstallSnapshotReply reply{currentTerm_.load()};
         if (args.term < currentTerm_.load()) {
-            done(json(reply).dump());
+            done(encodeISRep(reply));
             return;
         }
 
@@ -369,7 +564,7 @@ void RaftNode::handleInstallSnapshot(const std::string &reqJson, RpcServer::Done
 
         // 快照比我现有的更旧：忽略（避免状态倒退）
         if (args.lastIncludedIndex <= snapshotIndex_) {
-            done(json(reply).dump());
+            done(encodeISRep(reply));
             return;
         }
 
@@ -410,7 +605,7 @@ void RaftNode::handleInstallSnapshot(const std::string &reqJson, RpcServer::Done
         if (snapshotApplyCallback_)
             snapshotApplyCallback_(snapshotIndex_, snapshotData_);
 
-        done(json(reply).dump());
+        done(encodeISRep(reply));
     });
 }
 
@@ -427,6 +622,25 @@ void RaftNode::becomeFollower(uint64_t term) {
         for (auto &[idx, cb] : writeCallbacks_) cb(false, idx);
         writeCallbacks_.clear();
     }
+    // 丢失 Leader 身份：将所有待确认的线性读请求全部通知失败
+    for (auto &pr : pendingReads_) pr.cb(false);
+    pendingReads_.clear();
+    // 丢失 Leader 身份：失败所有来自 Follower 的远端 ReadIndex 请求
+    for (auto &rr : pendingRemoteReads_)
+        rr.done(encodeReadIndexResp(rr.requestId, 0, false));
+    pendingRemoteReads_.clear();
+    // 如果本节点之前是 Follower，清理本地 Follower ReadIndex 等待队列
+    for (auto &[reqId, pr] : followerPendingReads_) pr.cb(false);
+    followerPendingReads_.clear();
+    // Leader Transfer 收尾：若本次 step-down 是因为 transfer target 起票成功，
+    // 计入"成功让贤"指标；任何情况下都清理 transfer 标记。
+    if (state_.load() == State::Leader && leadershipTransferTarget_ != -1) {
+        leaderTransfersSucceeded_.fetch_add(1);
+        LOG_INFO << "[Node " << id_ << "] *** Leader Transfer 完成：让贤至 Node "
+                 << leadershipTransferTarget_ << " ***";
+    }
+    leadershipTransferTarget_ = -1;
+    transferDeadlineMs_       = 0;
     state_.store(State::Follower);
     currentTerm_.store(term);
     votedFor_ = -1;
@@ -440,6 +654,9 @@ void RaftNode::becomeCandidate() {
         for (auto &[idx, cb] : writeCallbacks_) cb(false, idx);
         writeCallbacks_.clear();
     }
+    // 候选期间不再跟随任何 Leader，清空本节点的 Follower ReadIndex 等待队列
+    for (auto &[reqId, pr] : followerPendingReads_) pr.cb(false);
+    followerPendingReads_.clear();
     // 【Raft 规则 §5.2】发起新选举时必须先递增自己的 term。
     // 这防止旧的投票响应（来自网络延迟）污染新一轮选举：
     // 旧回包的 term 不等于新 term，会在 onVoteReply 里被过滤掉。
@@ -457,9 +674,26 @@ void RaftNode::becomeCandidate() {
 void RaftNode::becomeLeader() {
     state_.store(State::Leader);
     leaderId_ = id_;
-    startupGrace_ = false;  // 已为 Leader，后续不再需启动宽限期
+    startupGrace_ = false;
     LOG_INFO << "[Node " << id_ << "] *** 成为领导者，任期=" << currentTerm_.load() << " ***";
     ++electionEpoch_;
+    // 上任后清理上一任可能遗留的 transfer 标记
+    leadershipTransferTarget_ = -1;
+    transferDeadlineMs_       = 0;
+
+    // ── No-op 条目（Raft Figure 8 安全性 + ReadIndex 前提）─────────────────
+    // Leader 不能直接提交前任 term 的条目（可能引发日志覆盖）。
+    // 通过追加一条属于当前 term 的 no-op 空条目，利用正常多数派确认规则，
+    // 间接将前任遗留的已复制但未提交的条目一并提交，恢复一致状态。
+    // ReadIndex 协议同样要求 Leader 必须先提交过本任期内的至少一条日志，
+    // 才能安全地用 commitIndex 作为 readIndex 的基准。
+    log_.push_back(LogEntry{currentTerm_.load(), ""});  // 空 cmd = no-op
+    persistLog();
+
+    // ── 重置 ReadIndex 心跳跟踪（新 Leader 上任，旧 epoch 全部作废）──────
+    readHeartbeatEpoch_ = 0;
+    readHeartbeatAcks_  = 1;  // 自己算一票
+    readConfirmedEpoch_ = 0;
 
     // 初始化 Leader 专属的 per-peer 追踪状态：
     //   nextIndex[i]  = lastLogIndex + 1   （乐观：先假设 follower 和我一样新）
@@ -472,7 +706,7 @@ void RaftNode::becomeLeader() {
         matchIndex_[peer.id] = 0;
     }
 
-    // 立刻广播一次复制（空 entries = 心跳），尽快通知所有 Follower 新 Leader 存在。
+    // 立刻广播一次复制（含 no-op 条目），尽快通知所有 Follower 新 Leader 存在。
     heartbeatTick();
 }
 
@@ -492,25 +726,26 @@ void RaftNode::resetElectionTimer() {
 }
 
 void RaftNode::electionTimerFired(uint64_t epoch) {
-    // 守卫①：epoch 不匹配 = 这个 timer 已被 resetElectionTimer 「覆盖」，是旧的，直接丢弃。
-    // 常见场景：收到 Leader 心跳后 resetElectionTimer，旧 timer 延迟触发 → 无效。
     if (epoch != electionEpoch_) return;
-    // 守卫②：如果自己已经是 Leader，不应再发起选举（正常不会走到这里，双重保险）。
     if (state_.load() == State::Leader) return;
-    // 守卫③：启动宽限期内绝不主动发起选举。
-    // 理由：一台刚重启的节点（尤其是上一任 Leader）log_ 可能比当前新 Leader 还长，
-    // 一旦 term++ 抬高任期 → 现任 Leader 被 §5.1 强制 step down → 重新比较 log →
-    // 落后但日志更长的旧 Leader 反而当选，造成可见的「重启节点高概率抢主」。
-    // grace 内只 reset timer 不发选举；正常 50ms 心跳会很快到达并清掉 grace。
-    // 兜底：start() 时挂了一次性 5s 定时器，避免冷启动整集群都在 grace 卡死。
     if (startupGrace_) {
         LOG_INFO << "[Node " << id_ << "] 选举超时但仍在启动宽限期内，抑制本次选举";
         resetElectionTimer();
         return;
     }
-    // 选举超时 = Leader 失联（可能宕机或网络分区）。转为候选人，发起新一轮选举。
-    becomeCandidate();
-    runElection(); // 为每个 peer 并发发射 collectVote 协程
+    // ── Pre-Vote 阶段 ─────────────────────────────────────────────────────
+    // 在真正递增 term 发起选举之前，先用 preVote=true 探测多数派。
+    // 如果探测成功，再调用 becomeCandidate() + runElection()。
+    // 这防止因短暂网络分区而被隔离的节点不断自增 term 后重新接入集群时
+    // 强制所有节点 step down（因为它的 term 远高于现任 Leader）。
+    preVoteCount_ = 1;  // 自己先给自己一票
+    uint64_t myEpoch  = electionEpoch_;
+    uint64_t nextTerm = currentTerm_.load() + 1;
+    LOG_INFO << "[Node " << id_ << "] 选举超时，发起预投票（预测 term=" << nextTerm << "）";
+    for (const auto &peer : peers_) {
+        if (peer.id == id_) continue;
+        collectPreVote(myEpoch, nextTerm, peer);
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -547,12 +782,11 @@ void RaftNode::runElection() {
 
 FireAndForget RaftNode::collectVote(uint64_t electionTerm, Peer peer) {
     // 构造请求（在挂起前，仍在 loop_ 线程）
-    RequestVoteArgs args{electionTerm, id_, lastLogIndex(), lastLogTerm()};
-    std::string reqJson = json(args).dump();
+    RequestVoteArgs args{electionTerm, id_, lastLogIndex(), lastLogTerm(), /*preVote=*/false};
 
     // ── 挂起点：发出 RPC，等待响应/超时 ────────────────────────────────
-    auto [ok, respJson] = co_await getOrCreateClient(peer)->callAsyncCo(
-        "RequestVote", reqJson, /*timeoutMs=*/150);
+    auto [ok, respBytes] = co_await getOrCreateClient(peer)->callAsyncCo(
+        "RequestVote", encodeRV(args), /*bypass=*/{}, /*timeoutMs=*/150);
 
     // ── 恢复点（loop_ 线程）────────────────────────────────────────────
     // 守卫①：在等待期间，节点状态可能已改变（如收到更高 term 退为 Follower）。
@@ -564,9 +798,9 @@ FireAndForget RaftNode::collectVote(uint64_t electionTerm, Peer peer) {
 
     RequestVoteReply reply{};
     try {
-        reply = json::parse(respJson).get<RequestVoteReply>();
+        reply = decodeRVRep(respBytes);
     } catch (...) {
-        co_return; // 解码失败，丢弃
+        co_return;
     }
 
     // 【Raft 规则 §5.1】回包 term 更大：立刻退位
@@ -578,8 +812,44 @@ FireAndForget RaftNode::collectVote(uint64_t electionTerm, Peer peer) {
     if (reply.voteGranted) {
         ++currentElectionVotes_;
         LOG_INFO << "[Node " << id_ << "] 收到节点 " << peer.id
-                 << " 的选票（已得票=" << currentElectionVotes_ << "/" << quorum_ << "，需要=" << quorum_ << "）";
+                 << " 的选票（已得票=" << currentElectionVotes_ << "/" << quorum_ << "）";
         if (currentElectionVotes_ >= quorum_) becomeLeader();
+    }
+}
+
+// ── Pre-Vote 协程：收集预投票，若达到 quorum 再转入真正选举 ─────────────
+FireAndForget RaftNode::collectPreVote(uint64_t myEpoch, uint64_t nextTerm, Peer peer) {
+    RequestVoteArgs args{nextTerm, id_, lastLogIndex(), lastLogTerm(), /*preVote=*/true};
+
+    auto [ok, respBytes] = co_await getOrCreateClient(peer)->callAsyncCo(
+        "RequestVote", encodeRV(args), /*bypass=*/{}, /*timeoutMs=*/150);
+
+    // 若在等待期间 epoch 已变（超时被重置或收到 Leader 心跳），则放弃本轮预投票
+    if (electionEpoch_ != myEpoch) co_return;
+    if (state_.load() != State::Follower) co_return;
+    if (!ok) co_return;
+
+    RequestVoteReply reply{};
+    try {
+        reply = decodeRVRep(respBytes);
+    } catch (...) {
+        co_return;
+    }
+
+    if (reply.term > currentTerm_.load()) {
+        becomeFollower(reply.term);
+        co_return;
+    }
+
+    if (reply.voteGranted) {
+        ++preVoteCount_;
+        LOG_INFO << "[Node " << id_ << "] 预投票：Node " << peer.id
+                 << " 赞成（已得=" << preVoteCount_ << "/" << quorum_ << "）";
+        if (preVoteCount_ >= quorum_) {
+            LOG_INFO << "[Node " << id_ << "] 预投票成功，发起正式选举（term=" << nextTerm << "）";
+            becomeCandidate();
+            runElection();
+        }
     }
 }
 
@@ -590,17 +860,24 @@ FireAndForget RaftNode::collectVote(uint64_t electionTerm, Peer peer) {
 // AsyncRpcClient 退避时钟并触发立即重连，消除指数退避造成的重连延迟。
 // ════════════════════════════════════════════════════════════════════════════
 
-void RaftNode::handleNodeAnnounce(const std::string &reqJson, RpcServer::Done done) {
+void RaftNode::handleNodeAnnounce(const std::string &payload, const std::string & /*bypass*/,
+                                   RpcServer::Done done) {
     int senderId = -1;
     try {
-        senderId = json::parse(reqJson).at("nodeId").get<int>();
+        raft_proto::NodeAnnounceReq pb;
+        pb.ParseFromString(payload);
+        senderId = pb.node_id();
     } catch (...) {
-        done(R"({})");
+        raft_proto::NodeAnnounceRep rep;
+        std::string s; rep.SerializeToString(&s);
+        done(s);
         return;
     }
 
     loop_.runInLoop([this, senderId, done = std::move(done)]() mutable {
-        done(R"({})");  // 立即回复，无需等待
+        raft_proto::NodeAnnounceRep rep;
+        std::string s; rep.SerializeToString(&s);
+        done(s);  // 立即回复
         // 找到对应 peer，唤醒其出站客户端
         for (const auto &peer : peers_) {
             if (peer.id == senderId) {
@@ -656,6 +933,11 @@ void RaftNode::handleNodeAnnounce(const std::string &reqJson, RpcServer::Done do
 
 void RaftNode::heartbeatTick() {
     if (state_.load() != State::Leader) return;
+    // 每次心跳递增 epoch，初始化 ack 计数（自己算一票）。
+    // replicateLog 成功后累计 ack；达到 quorum 时记录 readConfirmedEpoch_，
+    // 这表明我在该 epoch 仍是合法 Leader，可以安全兑现 ReadIndex 请求。
+    ++readHeartbeatEpoch_;
+    readHeartbeatAcks_ = 1;
     for (const auto &peer : peers_) {
         if (peer.id == id_) continue;
         replicateLog(peer);
@@ -690,9 +972,13 @@ FireAndForget RaftNode::replicateLog(Peer peer) {
     for (uint64_t i = ni; i <= lastLogIndex(); ++i)
         args.entries.push_back(logAt(i));
 
+    // 在 co_await 前捕获当前 epoch，恢复后用于 ReadIndex 确认
+    uint64_t myReadEpoch = readHeartbeatEpoch_;
+
     // ── 挂起点：发出 AppendEntries RPC ──────────────────────────────────
-    auto [ok, respJson] = co_await getOrCreateClient(peer)->callAsyncCo(
-        "AppendEntries", json(args).dump(), /*timeoutMs=*/100);
+    auto [protoBytes, bypass] = encodeAE(args);
+    auto [ok, respBytes] = co_await getOrCreateClient(peer)->callAsyncCo(
+        "AppendEntries", protoBytes, bypass, /*timeoutMs=*/100);
 
     // ── 恢复点（loop_ 线程）────────────────────────────────────────────
     if (!ok) co_return;                         // 超时/故障：下个 50ms 重试
@@ -700,7 +986,7 @@ FireAndForget RaftNode::replicateLog(Peer peer) {
 
     AppendEntriesReply reply{};
     try {
-        reply = json::parse(respJson).get<AppendEntriesReply>();
+        reply = decodeAERep(respBytes);
     } catch (...) { co_return; }
 
     if (reply.term > currentTerm_.load()) {
@@ -710,14 +996,29 @@ FireAndForget RaftNode::replicateLog(Peer peer) {
 
     if (reply.success) {
         // ── 成功：推进 matchIndex / nextIndex ───────────────────────────
-        // 注意：期间可能另一个 replicateLog 协程也成功更新了 matchIndex（并发 RPC），
-        // 只取更大值，避免「回退」（idempotent 更新）。
         uint64_t newMatch = args.prevLogIndex + (uint64_t)args.entries.size();
         if (newMatch > matchIndex_[peer.id]) {
             matchIndex_[peer.id] = newMatch;
             nextIndex_[peer.id]  = newMatch + 1;
         }
         advanceCommitIndex();
+
+        // ── Leader Transfer：target 追平日志后立即发 TimeoutNow ─────────
+        if (leadershipTransferTarget_ == peer.id
+            && matchIndex_[peer.id] >= lastLogIndex()) {
+            doTransferLeadership(peer.id);
+        }
+
+        // ── ReadIndex：累计此 epoch 的 quorum ack ───────────────────────
+        // 每个 replicateLog 成功即代表该 peer 确认"我仍是 Leader"，
+        // 当 ack 数达到 quorum 时，将 readConfirmedEpoch_ 推进到当前 epoch，
+        // 之后可以安全地兑现所有 requestEpoch < readConfirmedEpoch_ 的读请求。
+        if (readHeartbeatEpoch_ == myReadEpoch) {
+            if (++readHeartbeatAcks_ >= quorum_) {
+                readConfirmedEpoch_ = readHeartbeatEpoch_;
+                drainConfirmedReads();
+            }
+        }
     } else {
         // ── 失败（一致性检查不过）：用冲突提示加速回退 ─────────────────
         //
@@ -763,13 +1064,13 @@ FireAndForget RaftNode::sendInstallSnapshot(Peer peer) {
     LOG_INFO << "[Node " << id_ << "] 向节点 " << peer.id
              << " 发送快照 lastIndex=" << args.lastIncludedIndex;
 
-    auto [ok, respJson] = co_await getOrCreateClient(peer)->callAsyncCo(
-        "InstallSnapshot", json(args).dump(), /*timeoutMs=*/1000);
+    auto [ok, respBytes] = co_await getOrCreateClient(peer)->callAsyncCo(
+        "InstallSnapshot", encodeIS(args), /*bypass=*/{}, /*timeoutMs=*/1000);
 
     if (!ok || state_.load() != State::Leader) co_return;
 
     InstallSnapshotReply reply{};
-    try { reply = json::parse(respJson).get<InstallSnapshotReply>(); }
+    try { reply = decodeISRep(respBytes); }
     catch (...) { co_return; }
 
     if (reply.term > currentTerm_.load()) { becomeFollower(reply.term); co_return; }
@@ -815,16 +1116,286 @@ void RaftNode::applyCommitted() {
         uint64_t idx = lastApplied_.load() + 1;
         if (idx > lastLogIndex()) break; // 防御：不应发生
         lastApplied_.store(idx);
-        LOG_INFO << "[Node " << id_ << "] 应用日志 index=" << idx
-                 << " 命令=" << logAt(idx).cmd;
-        if (applyCallback_) applyCallback_(idx, logAt(idx).cmd);
-        // 如果有等待应用的写回调，处理完成后通知
+        // no-op 条目（becomeLeader 时插入的空 cmd）不传递给状态机
+        if (!logAt(idx).cmd.empty()) {
+            LOG_INFO << "[Node " << id_ << "] 应用日志 index=" << idx
+                     << " 命令=" << logAt(idx).cmd;
+            if (applyCallback_) applyCallback_(idx, logAt(idx).cmd);
+        }
         auto it = writeCallbacks_.find(idx);
         if (it != writeCallbacks_.end()) {
             it->second(true, it->first);
             writeCallbacks_.erase(it);
         }
     }
+    // lastApplied_ 推进后，尝试兑现所有满足 readIndex <= lastApplied_ 的读请求
+    drainConfirmedReads();
+    // 尝试兑现 Follower 侧等待 lastApplied >= readIndex 的 ReadIndex 请求
+    drainFollowerReads();
+}
+
+// ── 兑现已确认 Leader 身份的 ReadIndex 请求 ─────────────────────────────
+// 调用时机：readConfirmedEpoch_ 更新时 或 lastApplied_ 推进时。
+void RaftNode::drainConfirmedReads() {
+    auto it = pendingReads_.begin();
+    while (it != pendingReads_.end()) {
+        if (state_.load() != State::Leader) {
+            // 丢失 Leader 身份：通知所有待处理读请求失败
+            it->cb(false);
+            it = pendingReads_.erase(it);
+        } else if (readConfirmedEpoch_ > it->requestEpoch
+                   && lastApplied_.load() >= it->readIndex) {
+            // Leadership 已在 requestEpoch 之后得到多数派确认，
+            // 且状态机已至少应用到注册时的 commitIndex。线性一致性成立。
+            it->cb(true);
+            it = pendingReads_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // 远端 ReadIndex（来自 Follower 的查询）：Leader 确认 epoch 后直接回包，
+    // Follower 侧会再等 lastApplied >= readIndex 后才真正读状态机。
+    for (auto it2 = pendingRemoteReads_.begin(); it2 != pendingRemoteReads_.end(); ) {
+        if (state_.load() != State::Leader) {
+            it2->done(encodeReadIndexResp(it2->requestId, 0, false));
+            it2 = pendingRemoteReads_.erase(it2);
+        } else if (readConfirmedEpoch_ > it2->requestEpoch) {
+            it2->done(encodeReadIndexResp(it2->requestId, it2->readIndex, true));
+            it2 = pendingRemoteReads_.erase(it2);
+        } else {
+            ++it2;
+        }
+    }
+}
+
+// ── Follower 侧：当 lastApplied 推进时，尝试兑现等待 readIndex 的读请求 ──
+void RaftNode::drainFollowerReads() {
+    for (auto it = followerPendingReads_.begin(); it != followerPendingReads_.end(); ) {
+        auto &pr = it->second;
+        if (pr.readIndex > 0 && lastApplied_.load() >= pr.readIndex) {
+            pr.cb(true);
+            it = followerPendingReads_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// ── Leader 侧 handler：接收 Follower 发来的 ReadIndex 查询 ────────────────
+void RaftNode::handleReadIndex(const std::string &payload, const std::string & /*bypass*/,
+                               RpcServer::Done done) {
+    auto [followerId, requestId] = decodeReadIndexReq(payload);
+    loop_.runInLoop([this, followerId, requestId, done = std::move(done)]() mutable {
+        if (state_.load() != State::Leader) {
+            done(encodeReadIndexResp(requestId, 0, false));
+            return;
+        }
+        uint64_t ri = commitIndex_.load();
+        // 快速路径：当前 epoch 已被多数派确认，即刻回包
+        if (readConfirmedEpoch_ >= readHeartbeatEpoch_) {
+            done(encodeReadIndexResp(requestId, ri, true));
+            return;
+        }
+        // 慢速路径：等待下一轮心跳 epoch 确认后回包
+        pendingRemoteReads_.push_back({ri, readHeartbeatEpoch_, requestId, std::move(done)});
+    });
+}
+
+// ── Follower/Leader 统一线性读接口 ────────────────────────────────────────
+// Leader 走本地 ReadIndex 协议（等价于 proposeRead）；
+// Follower 向 Leader 发 ReadIndexReq RPC，收到确认的 readIndex 后
+// 在本地等 lastApplied >= readIndex，再回调 cb(true) 让调用方读本地状态机。
+void RaftNode::proposeFollowerRead(ReadCallback cb) {
+    loop_.runInLoop([this, cb = std::move(cb)]() mutable {
+        // ── Leader 快速路径（等价于 proposeRead）──
+        if (state_.load() == State::Leader) {
+            uint64_t readIndex = commitIndex_.load();
+            if (readConfirmedEpoch_ >= readHeartbeatEpoch_
+                && lastApplied_.load() >= readIndex) {
+                cb(true);
+                return;
+            }
+            pendingReads_.push_back({readIndex, readHeartbeatEpoch_, std::move(cb)});
+            return;
+        }
+        // ── Follower 路径：向 Leader 请求 readIndex ──
+        if (leaderId_ < 0) { cb(false); return; }
+        Peer *leaderPeer = nullptr;
+        for (auto &p : peers_) {
+            if (p.id == leaderId_) { leaderPeer = &p; break; }
+        }
+        if (!leaderPeer) { cb(false); return; }
+
+        uint64_t reqId = ++followerReadSeq_;
+        followerPendingReads_[reqId] = {0, std::move(cb)};
+        auto *client = getOrCreateClient(*leaderPeer);
+        client->callAsync(
+            "ReadIndex", encodeReadIndexReq(id_, reqId), /*bypass=*/{},
+            [this, reqId](bool ok, const std::string &respBytes) {
+                // callAsync 回调已在 loop_ 线程
+                auto it = followerPendingReads_.find(reqId);
+                if (it == followerPendingReads_.end()) return;  // 已被清理
+                if (!ok) {
+                    it->second.cb(false);
+                    followerPendingReads_.erase(it);
+                    return;
+                }
+                auto [rid, readIndex, respOk] = decodeReadIndexResp(respBytes);
+                if (!respOk) {
+                    it->second.cb(false);
+                    followerPendingReads_.erase(it);
+                    return;
+                }
+                it->second.readIndex = readIndex;
+                // 如果 lastApplied 已够（极少数情况：RPC 延迟内日志已追上），立即兑现
+                drainFollowerReads();
+            });
+    });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §6c  Leader Transfer（主动让贤）
+//
+// 协议步骤（Leader 视角）：
+//   1. 选定一个 target Follower（matchIndex 最高优先）
+//   2. 标记 leadershipTransferTarget_，从此拒绝新的 propose（避免追赶死循环）
+//   3. 若 target 已追平日志（matchIndex == lastLogIndex），立即发 TimeoutNow
+//      否则继续 replicateLog，等下一次 onAppendEntriesReply 看到追平再发
+//   4. target 收到 TimeoutNow → 跳过 election timeout 与 Pre-Vote → becomeCandidate
+//   5. 1s 兜底：若超时仍未感知到对方 becomeLeader，清理状态、恢复写入
+// ════════════════════════════════════════════════════════════════════════════
+
+namespace {
+inline uint64_t nowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+}
+
+// ── 选 transfer 目标：matchIndex 最高的 Follower（同分时取 id 最小）──────
+int RaftNode::pickTransferTarget() const {
+    int      best       = -1;
+    uint64_t bestMatch  = 0;
+    for (const auto &peer : peers_) {
+        if (peer.id == id_) continue;
+        auto it = matchIndex_.find(peer.id);
+        uint64_t mi = (it == matchIndex_.end()) ? 0 : it->second;
+        if (best < 0 || mi > bestMatch || (mi == bestMatch && peer.id < best)) {
+            best      = peer.id;
+            bestMatch = mi;
+        }
+    }
+    return best;
+}
+
+bool RaftNode::transferLeadership(int targetId) {
+    if (state_.load() != State::Leader) return false;
+    if (peers_.size() <= 1)             return false;  // 单节点集群无意义
+
+    leaderTransfersInitiated_.fetch_add(1);
+    loop_.runInLoop([this, targetId]() mutable {
+        if (state_.load() != State::Leader) return;
+
+        // 解析目标：-1 = 自动挑选
+        int target = targetId;
+        if (target < 0) target = pickTransferTarget();
+        if (target < 0 || target == id_) {
+            LOG_WARN << "[Node " << id_ << "] Leader Transfer：无可用目标";
+            return;
+        }
+        // 必须是已知 peer
+        bool found = false;
+        for (const auto &p : peers_)
+            if (p.id == target) { found = true; break; }
+        if (!found) {
+            LOG_WARN << "[Node " << id_ << "] Leader Transfer：目标 " << target << " 不在集群中";
+            return;
+        }
+
+        LOG_INFO << "[Node " << id_ << "] *** 主动 Leader Transfer：目标 -> Node "
+                 << target << " ***";
+        leadershipTransferTarget_ = target;
+        transferDeadlineMs_       = nowMs() + 1000;  // 1s 超时
+
+        // 1s 兜底超时：若到期仍未让贤成功，清状态恢复写入
+        loop_.runAfter(1.0, [this, target] {
+            if (state_.load() == State::Leader && leadershipTransferTarget_ == target) {
+                LOG_WARN << "[Node " << id_ << "] Leader Transfer 超时：放弃让贤，恢复 Leader 服务";
+                leadershipTransferTarget_ = -1;
+                transferDeadlineMs_       = 0;
+            }
+        });
+
+        // 立即评估一次：若 target 已追平日志，可直接发 TimeoutNow
+        doTransferLeadership(target);
+    });
+    return true;
+}
+
+// 内部：检查 target 是否已追平日志，若已追平立即发 TimeoutNow，否则触发一次复制
+void RaftNode::doTransferLeadership(int targetId) {
+    if (state_.load() != State::Leader) return;
+    if (leadershipTransferTarget_ != targetId) return;
+
+    Peer *targetPeer = nullptr;
+    for (auto &p : peers_)
+        if (p.id == targetId) { targetPeer = &p; break; }
+    if (!targetPeer) return;
+
+    uint64_t lastIdx = lastLogIndex();
+    auto it = matchIndex_.find(targetId);
+    uint64_t matched = (it == matchIndex_.end()) ? 0 : it->second;
+
+    if (matched < lastIdx) {
+        // 还没追平 → 触发一次复制，等 onAppendEntriesReply 后再调一次本函数
+        LOG_INFO << "[Node " << id_ << "] Leader Transfer：等待 target=" << targetId
+                 << " 追平日志（match=" << matched << " last=" << lastIdx << "）";
+        replicateLog(*targetPeer);
+        return;
+    }
+
+    // 已追平：发 TimeoutNow，让 target 立刻起票
+    LOG_INFO << "[Node " << id_ << "] Leader Transfer：target=" << targetId
+             << " 已追平 lastIdx=" << lastIdx << "，发送 TimeoutNow";
+    auto *client = getOrCreateClient(*targetPeer);
+    uint64_t myTerm = currentTerm_.load();
+    client->callAsync(
+        "TimeoutNow", encodeTimeoutNowReq(myTerm), /*bypass=*/{},
+        [this](bool ok, const std::string & /*resp*/) {
+            // 不论 ack 成功与否，对方一旦起票成功 currentTerm 会涨，本节点
+            // 在 handleRequestVote/handleAppendEntries 中会 becomeFollower。
+            // 这里只做调试日志。
+            if (!ok) LOG_WARN << "[Node " << id_ << "] TimeoutNow 发送失败（对端不可达）";
+        });
+}
+
+// ── Follower 侧：收到 TimeoutNow，立即起票（跳过 election timeout 与 Pre-Vote）──
+void RaftNode::handleTimeoutNow(const std::string &payload, const std::string & /*bypass*/,
+                                RpcServer::Done done) {
+    uint64_t senderTerm = decodeTimeoutNowReq(payload);
+    loop_.runInLoop([this, senderTerm, done = std::move(done)]() mutable {
+        // 仅当 sender term 与本节点 currentTerm 一致时接受
+        // （避免过时 Leader 的 TimeoutNow 干扰更新的集群状态）
+        if (senderTerm < currentTerm_.load()) {
+            done(encodeTimeoutNowResp(currentTerm_.load(), false));
+            return;
+        }
+        if (senderTerm > currentTerm_.load()) {
+            // 不该发生（sender 是当前 Leader），但严谨处理：跟进 term 后拒绝本次
+            becomeFollower(senderTerm);
+            done(encodeTimeoutNowResp(currentTerm_.load(), false));
+            return;
+        }
+        // term 一致：接受让贤指令
+        LOG_INFO << "[Node " << id_ << "] *** 收到 TimeoutNow（来自 Leader），立即发起选举 ***";
+        done(encodeTimeoutNowResp(currentTerm_.load(), true));
+
+        // becomeCandidate 内部会 ++currentTerm_、persist、resetElectionTimer，
+        // 然后由调用者负责发起 RequestVote。这里直接调用 runElection 走完流程。
+        // 关键点：跳过 Pre-Vote —— Leader 已为我们做完了 quorum 可达 + 日志追平的检查。
+        becomeCandidate();
+        runElection();
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -837,6 +1408,11 @@ void RaftNode::proposeAndNotify(const std::string &cmd, std::function<void(bool,
     // done(false, idx) = 丢失 Leader 身份（idx 为该条目被分配的下标，未分配时为 0）
     loop_.runInLoop([this, cmd, done = std::move(done)]() mutable {
         if (state_.load() != State::Leader) {
+            done(false, 0);
+            return;
+        }
+        // Leader Transfer 进行中：拒绝新写避免追赶死循环（target 永远追不上 lastLogIndex）
+        if (leadershipTransferTarget_ != -1) {
             done(false, 0);
             return;
         }
@@ -862,6 +1438,12 @@ void RaftNode::propose(const std::string &cmd) {
                      << "（当前领导者ID=" << leaderId_ << ")";
             return;
         }
+        // Leader Transfer 进行中：拒绝新写避免追赶死循环
+        if (leadershipTransferTarget_ != -1) {
+            LOG_WARN << "[Node " << id_ << "] 提案被拒绝：Leader Transfer 进行中 (target="
+                     << leadershipTransferTarget_ << ")";
+            return;
+        }
         // 追加到本地日志（Leader 自己的那份），term = currentTerm
         log_.push_back(LogEntry{currentTerm_.load(), cmd});
         persistLog();  // Leader 本地追加后立即落盘，崩溃不丢已接受的命令
@@ -872,6 +1454,32 @@ void RaftNode::propose(const std::string &cmd) {
             if (peer.id == id_) continue;
             replicateLog(peer);
         }
+    });
+}
+
+// ── 线性一致读：ReadIndex 协议 ───────────────────────────────────────────
+// 不写日志，不增加 term，仅确认"我现在仍是合法 Leader"后即可安全读取状态机。
+// 协议步骤：
+//   1. 记录当前 commitIndex 为 readIndex
+//   2. 向多数派发一轮心跳（下一次 heartbeatTick 自动完成，epoch 机制追踪）
+//   3. 当该 epoch 的心跳被多数派 ack（readConfirmedEpoch_ 推进）且
+//      lastApplied_ >= readIndex 时，cb(true) 返回给调用方
+//   4. 任何中途失去 Leader 身份的情况都 cb(false)
+void RaftNode::proposeRead(ReadCallback cb) {
+    loop_.runInLoop([this, cb = std::move(cb)]() mutable {
+        if (state_.load() != State::Leader) {
+            cb(false);
+            return;
+        }
+        uint64_t readIndex = commitIndex_.load();
+        // 快速路径：当前 epoch 已被多数派确认，且状态机已应用到 readIndex
+        if (readConfirmedEpoch_ >= readHeartbeatEpoch_
+            && lastApplied_.load() >= readIndex) {
+            cb(true);
+            return;
+        }
+        // 慢速路径：等待下一次心跳 epoch 确认后兑现
+        pendingReads_.push_back({readIndex, readHeartbeatEpoch_, std::move(cb)});
     });
 }
 

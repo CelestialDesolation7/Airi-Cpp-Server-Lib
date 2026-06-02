@@ -60,11 +60,8 @@ void KvHttpServer::handleWriteAsync(const std::string &cmd,
                                     const HttpRequest & /*req*/,
                                     HttpResponse *resp,
                                     Connection *conn) {
-    const int      myId    = node_.getId();
-    const uint64_t myTerm  = node_.getCurrentTerm();
-    const char    *myState = (node_.getState() == raft::State::Leader)    ? "Leader"
-                           : (node_.getState() == raft::State::Candidate) ? "Candidate"
-                                                                          : "Follower";
+    const int      myId   = node_.getId();
+    const uint64_t myTerm = node_.getCurrentTerm();
 
     if (!node_.isLeader()) {
         int         lid = node_.getLeaderId();
@@ -73,37 +70,19 @@ void KvHttpServer::handleWriteAsync(const std::string &cmd,
             resp->setStatus(HttpResponse::StatusCode::k307TemporaryRedirect, "Temporary Redirect");
             resp->addHeader("Location", url);
             resp->setContentType("application/json");
-            json j = {{"ok", false},
-                      {"status", "redirect"},
-                      {"reason", "本节点非 Leader，已 307 重定向到 Leader 节点"},
-                      {"fromNode", myId},
-                      {"fromState", myState},
-                      {"term", myTerm},
-                      {"leader", lid},
-                      {"leaderUrl", url},
-                      {"hint", "curl -L 会自动跟随；浏览器 fetch 默认也会跟随"}};
-            resp->setBody(j.dump());
+            // 极简重定向响应：只保留必要的诊断字段
+            resp->setBody(R"({"ok":false,"status":"redirect","leader":)" +
+                          std::to_string(lid) + R"(,"leaderUrl":")" + url + R"("})");
         } else {
             resp->setStatus(HttpResponse::StatusCode::k503ServiceUnavailable, "No Leader");
             resp->setContentType("application/json");
-            json j = {{"ok", false},
-                      {"status", "no_leader"},
-                      {"reason", "集群当前无 Leader（可能正在选举或多数派失联）"},
-                      {"fromNode", myId},
-                      {"fromState", myState},
-                      {"term", myTerm},
-                      {"hint", "稍候重试，或检查是否有 ≥ quorum 个节点存活"}};
-            resp->setBody(j.dump());
+            resp->setBody(R"({"ok":false,"status":"no_leader","term":)" +
+                          std::to_string(myTerm) + "}");
         }
-        return; // 同步路径，resp 由 HttpServer 正常发送
+        return;
     }
 
-    // ── Leader 路径：发 chunked 头 + "accepted" 首块 ──────────────────────────
-    const int      peerCount   = node_.getPeerCount();        // 含自己
-    const int      quorum      = node_.getQuorum();
-    const uint64_t commitBefore= node_.getCommitIndex();
-    const uint64_t lastLogBefore = node_.getLastLogIndex();
-
+    // ── Leader 路径：chunked 响应（首块立即发，尾块在 apply 后发）─────────
     std::string hdrs = "HTTP/1.1 200 OK\r\n"
                        "Content-Type: application/x-ndjson\r\n"
                        "Transfer-Encoding: chunked\r\n";
@@ -112,69 +91,64 @@ void KvHttpServer::handleWriteAsync(const std::string &cmd,
     }
     hdrs += "Connection: keep-alive\r\n\r\n";
 
-    json accepted = {
-        {"status", "accepted"},
-        {"phase", "1/2 leader 已接受请求，开始 Raft 复制"},
-        {"leader", myId},
-        {"term", myTerm},
-        {"clusterSize", peerCount},
-        {"quorum", quorum},
-        {"commitIndexBefore", commitBefore},
-        {"lastLogIndexBefore", lastLogBefore},
-        {"cmd", cmd},
-        {"timeline",
-         json::array({"client → Leader(Node " + std::to_string(myId) + ")",
-                      "Leader: append to local log",
-                      "Leader: AppendEntries → " + std::to_string(peerCount - 1) + " followers",
-                      "Followers ack → leader.matchIndex++",
-                      "matchIndex 多数派 ≥ N → commitIndex 推进",
-                      "applyCallback → KvStateMachine",
-                      "返回 applied 帧给 client"})}};
-    conn->send(hdrs + makeChunk(accepted.dump() + "\n"));
+    // 首块前快照：向前端提供完整的 Raft 状态信息
+    const int      clusterSize  = node_.getPeerCount();   // 含自身
+    const int      quorum       = node_.getQuorum();
+    const uint64_t commitBefore = node_.getCommitIndex();
+    const uint64_t lastLogBefore= node_.getLastLogIndex();
+
+    // 首块：告知客户端已接受，附带 Raft 集群元信息供前端渲染
+    {
+        json j = {
+            {"status",            "accepted"},
+            {"leader",            myId},
+            {"term",              myTerm},
+            {"clusterSize",       clusterSize},
+            {"quorum",            quorum},
+            {"commitIndexBefore", commitBefore},
+            {"lastLogIndexBefore",lastLogBefore},
+            {"cmd",               cmd}
+        };
+        conn->send(hdrs + makeChunk(j.dump() + "\n"));
+    }
     resp->setDeferred(true);
 
-    auto alive = conn->aliveFlag();
-    auto *loop = conn->getLoop();
-    auto  t0   = std::chrono::steady_clock::now();
+    auto alive   = conn->aliveFlag();
+    auto *loop   = conn->getLoop();
+    auto  t0     = std::chrono::steady_clock::now();
+    auto *nodePtr= &node_;
+    auto *smPtr  = &sm_;
 
     node_.proposeAndNotify(cmd,
-        [this, alive, loop, conn, myId, myTerm, peerCount, quorum, commitBefore, t0]
+        [alive, loop, conn, myId, myTerm, clusterSize, quorum, commitBefore, nodePtr, smPtr, t0]
         (bool ok, uint64_t logIndex) {
-            // proposeAndNotify 回调在 Raft 线程触发，queueInLoop 把任务投递到
-            // conn 的归属 sub-reactor 线程，确保 conn->send() 线程安全
-            loop->queueInLoop([this, alive, conn, ok, myId, myTerm, peerCount, quorum,
-                               commitBefore, t0, logIndex]() {
-                if (auto f = alive.lock(); !f || !*f)
-                    return; // 连接已关闭，放弃发送
-                const auto dtMs = std::chrono::duration<double, std::milli>(
+            loop->queueInLoop([alive, conn, ok, logIndex,
+                               myId, myTerm, clusterSize, quorum, commitBefore,
+                               nodePtr, smPtr, t0]() {
+                if (auto f = alive.lock(); !f || !*f) return;
+                const double dtMs = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();
-                json body;
+                std::string body;
                 if (ok) {
-                    body = {{"status", "applied"},
-                            {"ok", true},
-                            {"phase", "2/2 多数派已确认并 apply 到状态机"},
-                            {"leader", myId},
-                            {"term", myTerm},
-                            {"logIndex", logIndex},
-                            {"commitIndexBefore", commitBefore},
-                            {"commitIndexAfter", (uint64_t)node_.getCommitIndex()},
-                            {"lastApplied", (uint64_t)node_.getLastApplied()},
-                            {"kvSize", (uint64_t)sm_.size()},
-                            {"clusterSize", peerCount},
-                            {"quorum", quorum},
-                            {"latencyMs", dtMs},
-                            {"explain", "端到端耗时 = 本地落盘 + 一轮 RTT 到 quorum + apply"}};
+                    json j = {
+                        {"status",            "applied"},
+                        {"ok",                true},
+                        {"leader",            myId},
+                        {"term",              myTerm},
+                        {"logIndex",          logIndex},
+                        {"commitIndexBefore", commitBefore},
+                        {"commitIndexAfter",  nodePtr->getCommitIndex()},
+                        {"lastApplied",       nodePtr->getLastApplied()},
+                        {"quorum",            quorum},
+                        {"clusterSize",       clusterSize},
+                        {"kvSize",            smPtr->size()},
+                        {"latencyMs",         dtMs}
+                    };
+                    body = j.dump() + "\n";
                 } else {
-                    body = {{"status", "applied"},
-                            {"ok", false},
-                            {"phase", "失败：在 apply 之前丢失了 Leader 身份"},
-                            {"leader", myId},
-                            {"term", myTerm},
-                            {"logIndex", logIndex},
-                            {"latencyMs", dtMs},
-                            {"error", "leadership lost — 客户端应重试（新 Leader 会承担）"}};
+                    body = R"({"status":"error","ok":false,"reason":"leadership lost"})" "\n";
                 }
-                conn->send(makeChunk(body.dump() + "\n") + "0\r\n\r\n");
+                conn->send(makeChunk(body) + "0\r\n\r\n");
             });
         });
 }
@@ -231,21 +205,54 @@ void KvHttpServer::start() {
                    {"leaderId",    node_.getLeaderId()},
                    {"commitIndex", node_.getCommitIndex()},
                    {"lastApplied", node_.getLastApplied()},
-                   {"kvSize",      sm_.size()}};
+                   {"kvSize",      sm_.size()},
+                   {"transferTarget",     node_.getTransferTarget()},
+                   {"transfersInitiated", node_.getTransfersInitiated()},
+                   {"transfersSucceeded", node_.getTransfersSucceeded()}};
             resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
             resp->setContentType("application/json");
             resp->setBody(j.dump());
+        });
+
+    // ── POST /admin/transfer?to=<id>  →  主动 Leader Transfer（让贤）──────
+    // 仅 Leader 接收；to 可省略，省略时由 RaftNode 自动选 matchIndex 最高的 Follower。
+    srv_->addRoute(HttpRequest::Method::kPost, "/admin/transfer",
+        [this](const HttpRequest &req, HttpResponse *resp) {
+            resp->setContentType("application/json");
+            if (!node_.isLeader()) {
+                resp->setStatus(HttpResponse::StatusCode::k503ServiceUnavailable, "Not Leader");
+                resp->setBody(R"({"ok":false,"error":"not leader, send to current leader"})");
+                return;
+            }
+            std::string toStr = req.queryParam("to");
+            int target = -1;
+            if (!toStr.empty()) {
+                try { target = std::stoi(toStr); }
+                catch (...) {
+                    resp->setStatus(HttpResponse::StatusCode::k400BadRequest, "Bad Request");
+                    resp->setBody(R"({"ok":false,"error":"invalid 'to' param"})");
+                    return;
+                }
+            }
+            bool started = node_.transferLeadership(target);
+            if (!started) {
+                resp->setStatus(HttpResponse::StatusCode::k503ServiceUnavailable, "No Target");
+                resp->setBody(R"j({"ok":false,"error":"transfer not started (no target?)"})j");
+                return;
+            }
+            resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
+            resp->setBody(json{{"ok", true},
+                               {"from", node_.getId()},
+                               {"requestedTarget", target}}.dump());
         });
 
     // ── GET /admin/scan  →  返回所有 KV 对（供仪表盘 KV 表格刷新）──────────
     srv_->addRoute(HttpRequest::Method::kGet, "/admin/scan",
         [this](const HttpRequest &, HttpResponse *resp) {
             json pairs = json::array();
-            try {
-                auto j = json::parse(sm_.serialize());
-                for (auto &[k, v] : j.items())
-                    pairs.push_back({{"key", k}, {"value", v}});
-            } catch (...) {}
+            auto kv = sm_.scan();  // 取 map 副本（shared_lock，不阻塞其他读）
+            for (const auto &[k, v] : kv)
+                pairs.push_back({{"key", k}, {"value", v}});
             resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
             resp->setContentType("application/json");
             resp->setBody(json{{"ok", true},
@@ -253,9 +260,14 @@ void KvHttpServer::start() {
                                {"pairs", pairs}}.dump());
         });
 
-    // ── GET /kv/:key ─────────────────────────────────────────────────────────
-    srv_->addPrefixRoute(HttpRequest::Method::kGet, "/kv/",
-        [this](const HttpRequest &req, HttpResponse *resp) {
+    // ── GET /kv/:key —— 线性一致读（Follower ReadIndex 协议）────────────────
+    // 任意节点（Leader 或 Follower）均可处理读请求：
+    //   Leader：直接走本地 ReadIndex 协议。
+    //   Follower：向 Leader 发 ReadIndex RPC 拿到确认的 readIndex，
+    //             等 lastApplied >= readIndex 后读本地状态机（减少一次外部 RTT）。
+    // 写请求（PUT/DELETE）仍需 Leader 执行，非 Leader 返回 307。
+    srv_->addAsyncPrefixRoute(HttpRequest::Method::kGet, "/kv/",
+        [this](const HttpRequest &req, HttpResponse *resp, Connection *conn) {
             std::string key = extractKey(req.url());
             if (key.empty()) {
                 resp->setStatus(HttpResponse::StatusCode::k400BadRequest, "Bad Request");
@@ -263,34 +275,38 @@ void KvHttpServer::start() {
                 resp->setBody(R"({"ok":false,"error":"missing key"})");
                 return;
             }
-            // 附带读请求的节点元数据，供前端展示「本地读 / 可能脏读」提示
-            const int   servedBy = node_.getId();
-            const auto  st       = node_.getState();
-            const char *stateStr = (st == raft::State::Leader)    ? "Leader"
-                                 : (st == raft::State::Candidate) ? "Candidate"
-                                                                  : "Follower";
-            std::string value;
-            if (sm_.get(key, value)) {
-                resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
-                resp->setContentType("application/json");
-                resp->setBody(json{{"ok",           true},
-                                   {"key",          key},
-                                   {"value",        value},
-                                   {"servedBy",     servedBy},
-                                   {"servedByState",stateStr},
-                                   {"term",         node_.getCurrentTerm()},
-                                   {"lastApplied",  node_.getLastApplied()}}.dump());
-            } else {
-                resp->setStatus(HttpResponse::StatusCode::k404NotFound, "Not Found");
-                resp->setContentType("application/json");
-                resp->setBody(json{{"ok",           false},
-                                   {"key",          key},
-                                   {"error",        "not found"},
-                                   {"servedBy",     servedBy},
-                                   {"servedByState",stateStr},
-                                   {"term",         node_.getCurrentTerm()},
-                                   {"lastApplied",  node_.getLastApplied()}}.dump());
-            }
+            // 异步路径：所有节点均可参与，等 proposeFollowerRead 完成后再发响应
+            resp->setDeferred(true);
+            auto alive = conn->aliveFlag();
+            auto *loop = conn->getLoop();
+            node_.proposeFollowerRead([this, alive, loop, conn, key](bool ok) {
+                loop->queueInLoop([this, alive, conn, key, ok]() {
+                    if (auto f = alive.lock(); !f || !*f) return;
+                    std::string body;
+                    if (!ok) {
+                        body = R"({"ok":false,"error":"no leader or leadership lost, retry"})";
+                        conn->send("HTTP/1.1 503 Service Unavailable\r\n"
+                                   "Content-Type: application/json\r\n"
+                                   "Content-Length: " + std::to_string(body.size()) +
+                                   "\r\n\r\n" + body);
+                        return;
+                    }
+                    std::string value;
+                    if (sm_.get(key, value)) {
+                        body = R"({"ok":true,"key":")" + key + R"(","value":")" + value + R"("})";
+                        conn->send("HTTP/1.1 200 OK\r\n"
+                                   "Content-Type: application/json\r\n"
+                                   "Content-Length: " + std::to_string(body.size()) +
+                                   "\r\n\r\n" + body);
+                    } else {
+                        body = R"({"ok":false,"key":")" + key + R"(","error":"not found"})";
+                        conn->send("HTTP/1.1 404 Not Found\r\n"
+                                   "Content-Type: application/json\r\n"
+                                   "Content-Length: " + std::to_string(body.size()) +
+                                   "\r\n\r\n" + body);
+                    }
+                });
+            });
         });
 
     // ── PUT /kv/:key  (body = value)  ────────────────────────────────────────

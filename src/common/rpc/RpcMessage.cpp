@@ -1,71 +1,89 @@
-// RpcMessage —— 二进制帧协议实现
+// RpcMessage —— 二进制帧协议实现（Protobuf + Value 旁路透传版）
 //
-// 帧格式（12 字节定长头 + JSON payload）：
-//   [4B length BE] [4B msgType BE] [4B reqId BE] [JSON body ...]
-//
-// JSON body 形如：{"method": "echo", "body": <任意 JSON 值>}
+// 帧格式（16 字节定长头）：
+//   [4B proto_section_len BE]   // = 4 + method.size() + payload.size()
+//   [4B bypass_len BE]          // = bypass.size()（无旁路时为 0）
+//   [4B msgType BE]
+//   [4B reqId BE]
+//   ── variable section (proto_section_len bytes) ──
+//   [4B method_len BE] [method bytes] [payload bytes (Protobuf)]
+//   ── bypass section (bypass_len bytes) ──
+//   [raw value bytes]
 
 #include "rpc/RpcMessage.h"
 #include <arpa/inet.h>
 #include <cstring>
-#include <nlohmann/json.hpp>
-
-using nlohmann::json;
 
 std::string RpcMessage::encode() const {
-    // 1. 把 payload（调用方保证是合法 JSON 文本）解析成 JSON 值，再嵌入外层。
-    //    payload 为空时 body 设为 null。
-    json body = payload.empty() ? json(nullptr) : json::parse(payload);
-    json envelope = {
-        {"method", method},
-        {"body",   body},
-    };
-    std::string jsonText = envelope.dump();
-    uint32_t payloadLen = static_cast<uint32_t>(jsonText.size());
+    const uint32_t methodLen       = static_cast<uint32_t>(method.size());
+    const uint32_t protoSectionLen = 4u + methodLen + static_cast<uint32_t>(payload.size());
+    const uint32_t bypassLen       = static_cast<uint32_t>(bypass.size());
 
-    // 2. 12 字节头（全部网络字节序）
-    uint32_t netLen   = htonl(payloadLen);
-    uint32_t netType  = htonl(static_cast<uint32_t>(type));
-    uint32_t netReqId = htonl(reqId);
-
-    // 3. 拼装完整帧
     std::string frame;
-    frame.resize(12 + payloadLen);
-    std::memcpy(frame.data() + 0, &netLen,   4);
-    std::memcpy(frame.data() + 4, &netType,  4);
-    std::memcpy(frame.data() + 8, &netReqId, 4);
-    std::memcpy(frame.data() + 12, jsonText.data(), payloadLen);
+    frame.resize(16 + protoSectionLen + bypassLen);
+    char *p = frame.data();
+
+    const uint32_t netPSL   = htonl(protoSectionLen);
+    const uint32_t netBPL   = htonl(bypassLen);
+    const uint32_t netType  = htonl(static_cast<uint32_t>(type));
+    const uint32_t netReqId = htonl(reqId);
+    std::memcpy(p +  0, &netPSL,   4);
+    std::memcpy(p +  4, &netBPL,   4);
+    std::memcpy(p +  8, &netType,  4);
+    std::memcpy(p + 12, &netReqId, 4);
+
+    const uint32_t netML = htonl(methodLen);
+    std::memcpy(p + 16, &netML, 4);
+    if (methodLen  > 0) std::memcpy(p + 20,              method.data(),  methodLen);
+    if (!payload.empty()) std::memcpy(p + 20 + methodLen, payload.data(), payload.size());
+    if (!bypass.empty())  std::memcpy(p + 16 + protoSectionLen, bypass.data(), bypassLen);
+
     return frame;
 }
 
 bool RpcMessage::decode(const char *data, int len,
                         RpcMessage *out, int *consumed) {
-    if (len < 12) return false;
+    if (len < 16) return false;
 
-    uint32_t netLen, netType, netReqId;
-    std::memcpy(&netLen,   data + 0, 4);
-    std::memcpy(&netType,  data + 4, 4);
-    std::memcpy(&netReqId, data + 8, 4);
+    uint32_t netPSL, netBPL, netType, netReqId;
+    std::memcpy(&netPSL,   data +  0, 4);
+    std::memcpy(&netBPL,   data +  4, 4);
+    std::memcpy(&netType,  data +  8, 4);
+    std::memcpy(&netReqId, data + 12, 4);
 
-    uint32_t payloadLen = ntohl(netLen);
-    if (len < 12 + static_cast<int>(payloadLen)) return false;
+    const uint32_t protoSectionLen = ntohl(netPSL);
+    const uint32_t bypassLen       = ntohl(netBPL);
+
+    // 防止整型溢出：先用 uint64_t 做加法
+    const uint64_t totalNeeded64 = 16ULL + protoSectionLen + bypassLen;
+    if (totalNeeded64 > static_cast<uint64_t>(INT32_MAX)) return false;
+    const int totalNeeded = static_cast<int>(totalNeeded64);
+    if (len < totalNeeded)   return false;
+    if (protoSectionLen < 4) return false;  // 至少需要 method_len 字段
 
     out->type  = static_cast<RpcMessage::Type>(ntohl(netType));
     out->reqId = ntohl(netReqId);
 
-    // 用 nlohmann::json 安全解析；任何异常都视为协议错误，丢弃这条帧
-    try {
-        json envelope = json::parse(data + 12, data + 12 + payloadLen);
-        out->method   = envelope.value("method", std::string{});
-        if (envelope.contains("body") && !envelope["body"].is_null()) {
-            out->payload = envelope["body"].dump();
-        } else {
-            out->payload.clear();
-        }
-    } catch (const json::exception &) {
-        return false;
-    }
+    // 提取 method
+    uint32_t netML = 0;
+    std::memcpy(&netML, data + 16, 4);
+    const uint32_t methodLen = ntohl(netML);
+    if (4u + methodLen > protoSectionLen) return false;
+    out->method.assign(data + 20, methodLen);
 
-    *consumed = 12 + static_cast<int>(payloadLen);
+    // 提取 proto payload
+    const uint32_t protoBodyLen = protoSectionLen - 4u - methodLen;
+    if (protoBodyLen > 0)
+        out->payload.assign(data + 20 + methodLen, protoBodyLen);
+    else
+        out->payload.clear();
+
+    // 提取 bypass
+    if (bypassLen > 0)
+        out->bypass.assign(data + 16 + protoSectionLen, bypassLen);
+    else
+        out->bypass.clear();
+
+    *consumed = totalNeeded;
     return true;
 }

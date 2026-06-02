@@ -116,6 +116,27 @@
       </div>
     </div>
 
+    <!-- Raft 运维面板 -->
+    <div class="panel">
+      <h3>Raft 运维</h3>
+      <div style="font-size:11px;color:#8b949e;margin-bottom:8px">主动让贤（Leader Transfer）<span style="color:#484f58"> — 仅对当前 Leader 节点生效</span></div>
+      <div class="btn-row">
+        <button class="btn-amber" onclick="doTransfer(-1)" title="自动选 matchIndex 最高的 Follower">⚡ 自动让贤</button>
+      </div>
+      <div class="sel-label" style="margin-top:4px">指定让贤目标节点：</div>
+      <div class="btn-row" style="gap:4px">
+        <button class="btn-neutral" onclick="doTransfer(0)">→ N0</button>
+        <button class="btn-neutral" onclick="doTransfer(1)">→ N1</button>
+        <button class="btn-neutral" onclick="doTransfer(2)">→ N2</button>
+        <button class="btn-neutral" onclick="doTransfer(3)">→ N3</button>
+        <button class="btn-neutral" onclick="doTransfer(4)">→ N4</button>
+      </div>
+      <div style="font-size:10px;color:#484f58;margin-top:5px;line-height:1.7">
+        让贤期间写入被暂停（~50–200&nbsp;ms 完成）<br>
+        成功后原 Leader 变 Follower，term 不变
+      </div>
+    </div>
+
     <!-- 批量写入面板 -->
     <div class="panel">
       <h3>批量写入测试</h3>

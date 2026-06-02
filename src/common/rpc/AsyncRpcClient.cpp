@@ -64,20 +64,30 @@ void AsyncRpcClient::stop() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// §2 callAsync —— 任意线程入口；真正逻辑在 doCall（loop_ 线程）
+// §2 callAsync / wakeUp —— 任意线程入口；真正逻辑在 doCall（loop_ 线程）
 // ════════════════════════════════════════════════════════════════════════════
 
-void AsyncRpcClient::callAsync(const std::string &method, const std::string &requestJson,
-                               Callback cb, int timeoutMs) {
-    // 注意：method/requestJson 在 lambda 中按值拷贝，确保跨线程生命周期安全。
+void AsyncRpcClient::wakeUp() {
+    // 对端重新上线：清除退避状态，若当前空闲则立即发起重连。
+    // 可从任意线程调用（runInLoop 切回 loop_ 线程后再操作内部状态）。
+    loop_->runInLoop([this] {
+        if (state_ == State::kStopped) return;
+        backoff_.reset();
+        if (state_ == State::kIdle) startConnectLocked();
+    });
+}
+
+void AsyncRpcClient::callAsync(const std::string &method, const std::string &payload,
+                               const std::string &bypass, Callback cb, int timeoutMs) {
+    // method/payload/bypass 在 lambda 中按値拷贝，确保跨线程生命周期安全。
     loop_->runInLoop(
-        [this, method, requestJson, cb = std::move(cb), timeoutMs]() mutable {
-            doCall(method, requestJson, std::move(cb), timeoutMs);
+        [this, method, payload, bypass, cb = std::move(cb), timeoutMs]() mutable {
+            doCall(method, payload, bypass, std::move(cb), timeoutMs);
         });
 }
 
-void AsyncRpcClient::doCall(const std::string &method, const std::string &requestJson, Callback cb,
-                            int timeoutMs) {
+void AsyncRpcClient::doCall(const std::string &method, const std::string &payload,
+                            const std::string &bypass, Callback cb, int timeoutMs) {
     if (state_ == State::kStopped) {
         cb(false, "");
         return;
@@ -94,12 +104,13 @@ void AsyncRpcClient::doCall(const std::string &method, const std::string &reques
     loop_->runAfter(timeoutMs / 1000.0,
                     [this, reqId] { completeWithTimeout(reqId, reqId); });
 
-    // 3) 编码消息帧
+    // 3) 编码消息帧（payload = Protobuf 字节，bypass = 原始 value 字节）
     RpcMessage msg;
     msg.type    = RpcMessage::Type::kRequest;
     msg.reqId   = reqId;
     msg.method  = method;
-    msg.payload = requestJson;
+    msg.payload = payload;
+    msg.bypass  = bypass;
     std::string frame = msg.encode();
 
     // 4) 投递
@@ -239,14 +250,16 @@ void AsyncRpcClient::onResponse(Connection *conn) {
     buf->retrieve(n);
 
     while (true) {
-        // 防御性：peek 头 4 字节 length，过大直接关连接（对端可能恶意/损坏）
-        if (recvBuf_.size() >= 4) {
-            uint32_t netLen = 0;
-            std::memcpy(&netLen, recvBuf_.data(), 4);
-            uint32_t payloadLen = ntohl(netLen);
-            if (payloadLen > kMaxRpcPayloadBytes) {
+        // 防御性：peek 头 8 字节（proto_section_len + bypass_len）
+        if (recvBuf_.size() >= 8) {
+            uint32_t netPSL = 0, netBPL = 0;
+            std::memcpy(&netPSL, recvBuf_.data(),     4);
+            std::memcpy(&netBPL, recvBuf_.data() + 4, 4);
+            uint64_t total = static_cast<uint64_t>(ntohl(netPSL))
+                           + static_cast<uint64_t>(ntohl(netBPL));
+            if (total > kMaxRpcPayloadBytes) {
                 LOG_WARN << "[AsyncRpcClient] 对端响应 length 超限，关闭连接 " << ip_ << ":"
-                         << port_ << " claimed=" << payloadLen
+                         << port_ << " claimed=" << total
                          << " limit=" << kMaxRpcPayloadBytes;
                 conn->close();
                 return;
@@ -317,9 +330,10 @@ void AsyncRpcClient::completeWithTimeout(uint32_t reqId, uint64_t /*timerEpoch*/
 // callAsyncCo — 构造 RpcCallAwaiter 并返回（工厂函数）。
 // 不需要在 loop_ 线程调用（callAsync 内部已 runInLoop）。
 RpcCallAwaiter AsyncRpcClient::callAsyncCo(const std::string &method,
-                                            const std::string &requestJson,
+                                            const std::string &payload,
+                                            const std::string &bypass,
                                             int timeoutMs) {
-    return RpcCallAwaiter{this, method, requestJson, timeoutMs};
+    return RpcCallAwaiter{this, method, payload, bypass, timeoutMs};
 }
 
 // RpcCallAwaiter::await_suspend — co_await 的挂起入口。
@@ -336,7 +350,7 @@ RpcCallAwaiter AsyncRpcClient::callAsyncCo(const std::string &method,
 //
 void RpcCallAwaiter::await_suspend(std::coroutine_handle<> h) {
     client_->callAsync(
-        method_, json_,
+        method_, payload_, bypass_,
         [this, h](bool ok, std::string resp) mutable {
             // callback 在 loop_ 线程触发（callAsync 约定）。
             // 写入结果到协程帧（写在 resume 之前，保证 await_resume 可见）。

@@ -22,6 +22,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 避免 install(EXPORT) 把外部 target 拖入导出集。
 set(NLOHMANN_JSON_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 
+# ── 第三方依赖：Protobuf（Raft RPC 序列化 + Value 旁路透传）─────────────
+# brew install protobuf  →  find_package 可在 /opt/homebrew 找到
+find_package(Protobuf REQUIRED)
+# 生成 raft.pb.h / raft.pb.cc 到 ${CMAKE_BINARY_DIR}/src/proto/
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS src/proto/raft.proto)
+
 # ── Sanitizer flags ─────────────────────────────────────────────
 if(MCPP_ENABLE_ASAN)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
@@ -43,7 +49,8 @@ endif()
 # 头文件路径 - 使用 target_include_directories 而不是全局 include_directories
 # 稍后在 NetLib 目标定义之后设置 PUBLIC/PRIVATE include 目录
 
-# 扫描所有公共源文件（排除平台专有目录和不需要打包的文件）
+# 扫描所有公共源文件（排除平台专有目录、kv 应用层和不需要打包的文件）
+# kv/ 是基于本库构建的演示应用，不属于基础设施，其源文件随 kv_node 编译。
 file(GLOB_RECURSE COMMON_SOURCES "src/common/*.cpp")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/Poller/epoll/.*")
 list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/Poller/kqueue/.*")
@@ -60,10 +67,10 @@ if(ROCKSDB_LIB AND ROCKSDB_INCLUDE_DIR)
     message(STATUS "Airi-Cpp-Server-Lib: RocksDB found at ${ROCKSDB_LIB}")
 else()
     set(MCPP_HAS_ROCKSDB OFF)
-    message(STATUS "Airi-Cpp-Server-Lib: RocksDB not found — RocksDBStorage 已从构建中排除 (brew install rocksdb)")
+    message(STATUS "Airi-Cpp-Server-Lib: RocksDB not found — RocksDBStorage/RocksKvStore 已从构建中排除 (brew install rocksdb)")
     list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/RocksDBStorage\\.cpp")
+    list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/RocksKvStore\\.cpp")
 endif()
-
 
 # 按平台加入唯一的那个实现文件
 set(PLATFORM_SOURCES "")
@@ -78,16 +85,7 @@ else()
 endif()
 
 # 1. 核心库 (将决定权交给使用者)
-add_library(NetLib ${COMMON_SOURCES} ${PLATFORM_SOURCES})
-
-# RocksDB 链接（可选）
-if(MCPP_HAS_ROCKSDB)
-    target_include_directories(NetLib PUBLIC
-        $<BUILD_INTERFACE:${ROCKSDB_INCLUDE_DIR}>)
-    target_link_libraries(NetLib PUBLIC "${ROCKSDB_LIB}")
-    target_compile_definitions(NetLib PUBLIC MCPP_HAS_ROCKSDB=1)
-endif()
-
+add_library(NetLib ${COMMON_SOURCES} ${PLATFORM_SOURCES} ${PROTO_SRCS})
 set_target_properties(NetLib PROPERTIES OUTPUT_NAME "Airi-Cpp-Server-Lib")
 add_library(Airi-Cpp-Server-Lib::NetLib ALIAS NetLib)
 
@@ -95,6 +93,12 @@ add_library(Airi-Cpp-Server-Lib::NetLib ALIAS NetLib)
 # 但不把绝对路径写进安装后的配置文件）
 target_include_directories(NetLib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
+
+# Protobuf：生成头文件路径（PRIVATE，proto 类型不暴露给消费者）
+target_include_directories(NetLib PRIVATE
+    ${Protobuf_INCLUDE_DIRS}
+    ${CMAKE_BINARY_DIR})
+target_link_libraries(NetLib PRIVATE protobuf::libprotobuf)
 
 set(MYCPPSERVERLIB_WITH_OPENSSL OFF)
 if(MCPP_ENABLE_OPENSSL)
@@ -119,6 +123,14 @@ else()
     message(STATUS "Airi-Cpp-Server-Lib: zlib not found, gzip middleware disabled")
 endif()
 
+# RocksDB 链接与宏
+if(MCPP_HAS_ROCKSDB)
+    target_include_directories(NetLib PUBLIC
+        $<BUILD_INTERFACE:${ROCKSDB_INCLUDE_DIR}>)
+    target_link_libraries(NetLib PUBLIC "${ROCKSDB_LIB}")
+    target_compile_definitions(NetLib PUBLIC MCPP_HAS_ROCKSDB=1)
+endif()
+
 # 设置头文件搜索路径：构建时(BUILD_INTERFACE)和安装后(INSTALL_INTERFACE)
 target_include_directories(NetLib 
     PUBLIC 
@@ -131,6 +143,7 @@ target_include_directories(NetLib
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/async>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/memory>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/coro>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/lb>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/net>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/net/Poller>
@@ -205,27 +218,28 @@ add_executable(raft_demo examples/src/raft_demo.cpp)
 target_link_libraries(raft_demo NetLib pthread)
 set_target_properties(raft_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
 
-# L7 反向代理负载均衡 Demo
+# L7 反向代理 + 多策略负载均衡演示
 add_executable(lb_demo examples/src/lb_demo.cpp)
 target_link_libraries(lb_demo NetLib pthread)
 set_target_properties(lb_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
 
-# ── 分布式 KV 存储节点 ────────────────────────────────────────────────────────
+# 分布式 KV 存储演示（Raft + KvStateMachine + REST HTTP）
+# kv/ 应用层代码不属于 NetLib，在此处直接编译为 kv_node 的一部分。
 set(KV_SOURCES
-    examples/src/kv/KvStateMachine.cpp
-    examples/src/kv/KvHttpServer.cpp
     examples/src/kv_node.cpp
+    examples/src/kv/KvHttpServer.cpp
+    examples/src/kv/KvStateMachine.cpp
 )
 if(MCPP_HAS_ROCKSDB)
     list(APPEND KV_SOURCES examples/src/kv/RocksKvStore.cpp)
 endif()
-
 add_executable(kv_node ${KV_SOURCES})
-target_include_directories(kv_node PRIVATE examples/include)
-target_link_libraries(kv_node NetLib pthread)
+target_include_directories(kv_node PRIVATE
+    examples/include
+    ${CMAKE_BINARY_DIR}        # raft.pb.h 生成路径
+    ${Protobuf_INCLUDE_DIRS})
+target_link_libraries(kv_node NetLib pthread protobuf::libprotobuf)
 set_target_properties(kv_node PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
-
-
 
 if(ZLIB_FOUND)
     target_link_libraries(http_server ZLIB::ZLIB)

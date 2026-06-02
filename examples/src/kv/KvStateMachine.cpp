@@ -1,9 +1,7 @@
 #include "kv/KvStateMachine.h"
 #include "log/Logger.h"
-#include <nlohmann/json.hpp>
+#include "raft.pb.h"
 #include <sstream>
-
-using json = nlohmann::json;
 
 void KvStateMachine::apply(uint64_t index, const std::string &cmd) {
     std::istringstream ss(cmd);
@@ -16,7 +14,7 @@ void KvStateMachine::apply(uint64_t index, const std::string &cmd) {
         std::string value;
         // value 取第一个空白后的全部剩余内容（允许空格）
         if (std::getline(ss >> std::ws, value)) {
-            std::lock_guard<std::mutex> lk(mu_);
+            std::unique_lock<std::shared_mutex> lk(mu_);
             map_[key] = value;
             LOG_DEBUG << "[KvSM] apply index=" << index
                       << " PUT " << key << "=" << value;
@@ -24,7 +22,7 @@ void KvStateMachine::apply(uint64_t index, const std::string &cmd) {
     } else if (op == "DEL") {
         std::string key;
         ss >> key;
-        std::lock_guard<std::mutex> lk(mu_);
+        std::unique_lock<std::shared_mutex> lk(mu_);
         map_.erase(key);
         LOG_DEBUG << "[KvSM] apply index=" << index << " DEL " << key;
     } else {
@@ -34,7 +32,7 @@ void KvStateMachine::apply(uint64_t index, const std::string &cmd) {
 }
 
 bool KvStateMachine::get(const std::string &key, std::string &value) const {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::shared_lock<std::shared_mutex> lk(mu_);
     auto it = map_.find(key);
     if (it == map_.end()) return false;
     value = it->second;
@@ -42,26 +40,43 @@ bool KvStateMachine::get(const std::string &key, std::string &value) const {
 }
 
 size_t KvStateMachine::size() const {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::shared_lock<std::shared_mutex> lk(mu_);
     return map_.size();
 }
 
+std::unordered_map<std::string, std::string> KvStateMachine::scan() const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    return map_;  // 返回 map 的完整副本，锁仅在拷贝期间持有
+}
+
 std::string KvStateMachine::serialize() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    json j = map_;
-    return j.dump();
+    // Protobuf 二进制格式：KvSnapshot 消息，entries 字段存储全部 KV 对
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    raft_proto::KvSnapshot pb;
+    for (const auto &[k, v] : map_) {
+        auto *e = pb.add_entries();
+        e->set_key(k);
+        e->set_value(v);
+    }
+    std::string out;
+    pb.SerializeToString(&out);
+    return out;
 }
 
 void KvStateMachine::applySnapshot(uint64_t index, const std::string &data) {
-    try {
-        auto j = json::parse(data);
-        auto newMap = j.get<std::unordered_map<std::string, std::string>>();
-        std::lock_guard<std::mutex> lk(mu_);
-        map_ = std::move(newMap);
-        LOG_INFO << "[KvSM] applySnapshot index=" << index
-                 << " entries=" << map_.size();
-    } catch (const std::exception &e) {
-        LOG_WARN << "[KvSM] applySnapshot parse error: " << e.what()
-                 << " — 保留当前状态";
+    raft_proto::KvSnapshot pb;
+    if (!pb.ParseFromString(data)) {
+        LOG_WARN << "[KvSM] applySnapshot index=" << index
+                 << " 解析 KvSnapshot Protobuf 失败 — 保留当前状态";
+        return;
     }
+    std::unordered_map<std::string, std::string> newMap;
+    newMap.reserve(static_cast<size_t>(pb.entries_size()));
+    for (const auto &e : pb.entries()) {
+        newMap[e.key()] = e.value();
+    }
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    map_ = std::move(newMap);
+    LOG_INFO << "[KvSM] applySnapshot index=" << index
+             << " entries=" << map_.size();
 }

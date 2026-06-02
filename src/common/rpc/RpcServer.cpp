@@ -48,15 +48,18 @@ void RpcServer::onMessage(Connection *conn) {
     buf->retrieve(n);
 
     while (true) {
-        // ── 防御性：在 decode 前先 peek 头 4 字节的 length，拒绝过大的帧 ──────
-        // 旧版直接 decode，恶意客户端可以声明 length=4GB 让 ctx->buf 无界膨胀。
-        if (ctx->buf.size() >= 4) {
-            uint32_t netLen = 0;
-            std::memcpy(&netLen, ctx->buf.data(), 4);
-            uint32_t payloadLen = ntohl(netLen);
-            if (payloadLen > kMaxRpcPayloadBytes) {
+        // ── 防御性：在 decode 前 peek 头 8 字节，拒绝过大的帧 ─────────────────
+        // 新帧格式：[4B proto_section_len][4B bypass_len]...
+        // 合法帧总 payload ≤ proto_section_len + bypass_len
+        if (ctx->buf.size() >= 8) {
+            uint32_t netPSL = 0, netBPL = 0;
+            std::memcpy(&netPSL, ctx->buf.data(),     4);
+            std::memcpy(&netBPL, ctx->buf.data() + 4, 4);
+            uint64_t total = static_cast<uint64_t>(ntohl(netPSL))
+                           + static_cast<uint64_t>(ntohl(netBPL));
+            if (total > kMaxRpcPayloadBytes) {
                 LOG_WARN << "[RpcServer] 拒绝过大帧并关闭连接 fd=" << conn->getSocket()->getFd()
-                         << " claimed=" << payloadLen << " limit=" << kMaxRpcPayloadBytes;
+                         << " claimed=" << total << " limit=" << kMaxRpcPayloadBytes;
                 conn->close();
                 return;
             }
@@ -111,6 +114,7 @@ void RpcServer::onMessage(Connection *conn) {
         };
 
         // handler 立刻返回；sub-reactor 继续解下一帧，永不阻塞。
-        it->second(msg.payload, std::move(done));
+        // 新签名：handler(payload, bypass, done)
+        it->second(msg.payload, msg.bypass, std::move(done));
     }
 }

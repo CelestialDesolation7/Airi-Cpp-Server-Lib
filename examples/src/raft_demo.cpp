@@ -28,6 +28,9 @@
 #include "net/SignalHandler.h"
 #include "raft/FileStorage.h"
 #include "raft/RaftNode.h"
+#ifdef MCPP_HAS_ROCKSDB
+#  include "raft/RocksDBStorage.h"
+#endif
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -87,11 +90,17 @@ int main(int argc, char **argv) {
 
     raft::RaftNode node(myId, peers, myPort);
 
-    // Day34：启用持久化
+    // Day34.5：启用持久化 —— 优先 RocksDB，回退 FileStorage
     if (persist) {
         std::string dataDir = "./raft_state/node_" + std::to_string(myId);
         std::cout << "[Node " << myId << "] 持久化目录：" << dataDir << "\n";
+#ifdef MCPP_HAS_ROCKSDB
+        std::cout << "[Node " << myId << "] 使用 RocksDBStorage 后端\n";
+        node.setStorage(std::make_unique<raft::RocksDBStorage>(dataDir));
+#else
+        std::cout << "[Node " << myId << "] 使用 FileStorage 后端（未编译 RocksDB）\n";
         node.setStorage(std::make_unique<raft::FileStorage>(dataDir));
+#endif
     }
 
     // 注册状态机回调：每条提交的命令都打印一行（可换成真正的 KV 应用）
@@ -104,7 +113,7 @@ int main(int argc, char **argv) {
         // Day34：达到阈值时触发快照压缩
         if (snapshotEvery > 0 && ++applyCount % snapshotEvery == 0) {
             // data 字段：真实系统这里放状态机序列化结果；demo 用 "snap@<index>"
-            node.takeSnapshot("snap@" + std::to_string(index));
+            node.takeSnapshot(index, "snap@" + std::to_string(index));
         }
     });
 

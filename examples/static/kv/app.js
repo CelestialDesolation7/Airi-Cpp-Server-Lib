@@ -64,11 +64,19 @@ async function pollCluster() {
       const ns = document.getElementById('ns-' + i);
       ns.className   = 'node-state ' + (cls[d.state] || 'state-down');
       ns.textContent = (icons[d.state] || d.state);
+      // 让贤状态徽标
+      const xferBadge = (d.transferTarget !== undefined && d.transferTarget >= 0)
+        ? ' &nbsp;<span style="color:#d29922;font-weight:bold">&rarr;N' + d.transferTarget + '</span>' : '';
+      // 让贤统计（仅 Leader 且有记录时显示）
+      const xferStats = (d.state === 'Leader' &&
+                          d.transfersInitiated !== undefined && d.transfersInitiated > 0)
+        ? '<br><span style="color:#d29922">transfers: <b>' +
+          d.transfersSucceeded + '</b>/' + d.transfersInitiated + '</span>' : '';
       document.getElementById('nst-' + i).innerHTML =
         'term: <b>' + d.term + '</b> &nbsp; commit: <b>' + d.commitIndex +
         '</b> &nbsp; applied: <b>' + d.lastApplied + '</b><br>' +
         'kv: <b>' + d.kvSize + '</b> &nbsp; leader: <b>' +
-        (d.leaderId < 0 ? '?' : 'Node ' + d.leaderId) + '</b>';
+        (d.leaderId < 0 ? '?' : 'Node ' + d.leaderId) + '</b>' + xferBadge + xferStats;
       // 同步 node-sel 按钮的 leader 样式
       const nsb = document.getElementById('nsb-' + i);
       if (nsb) {
@@ -519,6 +527,42 @@ async function startBatch() {
 
 function stopBatch() {
   batchActive = false;
+}
+
+// ── Leader Transfer ─────────────────────────────────────────────────────────
+async function doTransfer(targetId) {
+  // 找到当前 Leader
+  let leaderIdx = -1;
+  for (let i = 0; i < PORTS.length; i++) {
+    if (nodeInfo[i] && nodeInfo[i].state === 'Leader') { leaderIdx = i; break; }
+  }
+  if (leaderIdx < 0) {
+    setResp('\u26a0\ufe0f 当前无 Leader，请稍等集群选主后再试', false, 'Leader Transfer');
+    return;
+  }
+  const info = nodeInfo[leaderIdx];
+  const url  = 'http://127.0.0.1:' + PORTS[leaderIdx] + '/admin/transfer' +
+               (targetId >= 0 ? '?to=' + targetId : '');
+  try {
+    const r = await fetch(url, { method: 'POST', signal: AbortSignal.timeout(1500) });
+    const d = await r.json().catch(() => ({}));
+    const tgtStr = targetId >= 0 ? 'Node ' + targetId : '\u81ea\u52a8\uff08matchIndex \u6700\u9ad8\uff09';
+    const lines = [
+      '\u26a1 Leader Transfer \u5df2\u89e6\u53d1',
+      '',
+      '  \u6e90\u8282\u70b9:   Node ' + leaderIdx + '  (term=' + (info?.term ?? '?') + ')',
+      '  \u76ee\u6807\u8282\u70b9: ' + tgtStr,
+      '  \u72b6\u6001:     ' + (d.ok ? '\u2705 \u542f\u52a8\u6210\u529f' : '\u274c ' + (d.error || '\u5931\u8d25')),
+      '',
+      '  \u8bf7\u89c2\u5bdf\u8282\u70b9\u5361\u7247 Leader \u53d8\u5316\uff08\u7ea6 50\u2013200\u00a0ms\uff09',
+      '  \u8ba9\u8d42\u671f\u95f4\u5199\u5165\u88ab\u6682\u505c\uff0c\u5b8c\u6210\u540e\u81ea\u52a8\u6062\u590d'
+    ];
+    setResp(lines.join('\n'), d.ok, 'Leader Transfer');
+  } catch (e) { setResp('\u7f51\u7edc\u9519\u8bef: ' + e.message, false, 'Leader Transfer'); }
+  // 立刻刷新状态卡片
+  setTimeout(pollCluster, 150);
+  setTimeout(pollCluster, 400);
+  setTimeout(pollCluster, 900);
 }
 
 // ── 启动 ─────────────────────────────────────────────────────────────────────

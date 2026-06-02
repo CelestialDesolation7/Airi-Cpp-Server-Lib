@@ -1,0 +1,108 @@
+// raft.proto —— Raft RPC 消息定义（Protobuf 3）
+//
+// 设计原则：
+//   · 所有"控制平面"字段（term、index、leader ID…）用 proto 编码。
+//   · AppendEntries 中每条 LogEntry 的 value 字节不在 proto 中，
+//     而是通过 RpcMessage::bypass 字段旁路透传（无任何序列化开销）。
+//     LogEntry.vlen 记录该条目对应的 bypass 字节数，供接收方切分。
+//   · 快照数据（InstallSnapshot.data）因语义上是一次性大块数据，
+//     仍走 proto bytes 字段（简化实现，可未来改为 bypass）。
+//
+syntax = "proto3";
+package raft_proto;
+
+// ── 日志条目元数据（value 通过 bypass 字段透传，不在此结构中）────────────
+message LogEntry {
+    uint64 term = 1;  // 写入时的 Leader term
+    bytes  cmd  = 2;  // 结构化命令头："PUT <key>" 或 "DEL <key>"（无 value 部分）
+    uint32 vlen = 3;  // 对应 bypass 中的 value 字节数；纯心跳/no-op 时为 0
+}
+
+// ── AppendEntries RPC ──────────────────────────────────────────────────────
+message AppendEntriesReq {
+    uint64            term      = 1;
+    int32             leader_id = 2;
+    uint64            prev_idx  = 3;
+    uint64            prev_term = 4;
+    uint64            commit    = 5;
+    repeated LogEntry entries   = 6;
+    // value bytes 在 RpcMessage::bypass 中，按 entries[i].vlen 顺序拼接
+}
+
+message AppendEntriesRep {
+    uint64 term           = 1;
+    bool   success        = 2;
+    uint64 conflict_index = 3;
+    uint64 conflict_term  = 4;
+}
+
+// ── RequestVote RPC ────────────────────────────────────────────────────────
+message RequestVoteReq {
+    uint64 term           = 1;
+    int32  candidate_id   = 2;
+    uint64 last_log_index = 3;
+    uint64 last_log_term  = 4;
+    bool   pre_vote       = 5;
+}
+
+message RequestVoteRep {
+    uint64 term         = 1;
+    bool   vote_granted = 2;
+}
+
+// ── InstallSnapshot RPC ───────────────────────────────────────────────────
+message InstallSnapshotReq {
+    uint64 term                = 1;
+    int32  leader_id           = 2;
+    uint64 last_included_index = 3;
+    uint64 last_included_term  = 4;
+    bytes  data                = 5;  // 状态机快照（可能较大，未来可改为 bypass）
+}
+
+message InstallSnapshotRep {
+    uint64 term = 1;
+}
+
+// ── NodeAnnounce RPC（重启上线通知）────────────────────────────────────────
+message NodeAnnounceReq {
+    int32 node_id = 1;
+}
+
+message NodeAnnounceRep {}
+
+// ── KV 状态机快照（应用层，序列化 map<string,string> 业务数据）────────────
+// 与 Raft 元数据（term/log/votedFor）无关，仅供 KvStateMachine 快照编解码使用。
+// 存储在 InstallSnapshotReq.data 字段中作为 bytes 传输。
+// 使用 repeated KvEntry 而非 map<string,string>，避免引入 absl::KeyMapBase 符号
+// 导致 kv_node（独立可执行）链接时需要显式引入 Abseil 全套库。
+message KvEntry {
+    string key   = 1;
+    string value = 2;
+}
+message KvSnapshot {
+    repeated KvEntry entries = 1;
+}
+
+// ── Follower ReadIndex RPC ─────────────────────────────────────────────────
+// Follower 向 Leader 请求当前 commitIndex，用于本地线性一致读。
+message ReadIndexReq {
+    uint64 follower_id = 1;   // 请求方节点 ID（调试用）
+    uint64 request_id  = 2;   // Follower 侧唯一 ID，回包时原样返回用于对应
+}
+message ReadIndexResp {
+    uint64 request_id = 1;   // 与 ReadIndexReq.request_id 对应
+    uint64 read_index = 2;   // Leader 当前 commitIndex（Follower 需等到 lastApplied >= 此值）
+    bool   ok         = 3;   // false = 非 Leader 或 Leader 身份未确认
+}
+
+// ── Leader Transfer：TimeoutNow RPC ────────────────────────────────────────
+// Leader 向被选定的 Follower 发起的"立即起票"指令。
+// 收到后该 Follower 跳过 election timeout 与 Pre-Vote，直接 becomeCandidate，
+// 用于运维主动让贤、滚动升级等场景，避免被动选主带来的写空窗。
+message TimeoutNowReq {
+    uint64 term = 1;          // Leader 当前 term，过期的 TimeoutNow 必须丢弃
+}
+message TimeoutNowResp {
+    uint64 term = 1;          // 接收方当前 term
+    bool   ok   = 2;          // 是否接受（接受方将立即开始选举）
+}
