@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Airi 分布式 KV 集群 仪表盘</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{background:#0d1117;color:#c9d1d9;font-family:'SF Mono',Consolas,monospace;font-size:13px;padding:16px}
+    header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding:10px 16px;background:#161b22;border-radius:8px;border:1px solid #30363d}
+    h1{color:#58a6ff;font-size:15px;letter-spacing:.5px}
+    .badge{background:#1f6feb;color:#fff;padding:3px 10px;border-radius:12px;font-size:11px}
+
+    /* ── Cluster cards ── */
+    .cluster{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:14px}
+    .node-card{background:#161b22;border:2px solid #30363d;border-radius:8px;padding:12px;transition:border-color .3s,box-shadow .3s;cursor:default}
+    .node-card.leader{border-color:#238636;box-shadow:0 0 10px #23863640}
+    .node-card.candidate{border-color:#d29922;box-shadow:0 0 10px #d2992240}
+    .node-card.down{border-color:#21262d;opacity:.5}
+    .node-title{font-weight:bold;margin-bottom:6px;font-size:12px;color:#8b949e}
+    .node-state{font-size:15px;font-weight:bold;margin-bottom:6px}
+    .state-leader{color:#3fb950}.state-follower{color:#79c0ff}.state-candidate{color:#d29922}.state-down{color:#484f58}
+    .node-stats{font-size:11px;color:#8b949e;line-height:1.8}
+
+    /* ── Main layout: ops-col | response-col ── */
+    .top-grid{display:grid;grid-template-columns:320px 1fr;gap:10px;margin-bottom:10px;align-items:start}
+    .ops-col{display:flex;flex-direction:column;gap:10px}
+
+    /* ── Panels ── */
+    .panel{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px}
+    .panel h3{color:#58a6ff;margin-bottom:10px;font-size:13px;border-bottom:1px solid #21262d;padding-bottom:7px}
+
+    /* ── Form controls ── */
+    input,textarea{width:100%;background:#010409;border:1px solid #30363d;color:#c9d1d9;padding:7px 9px;border-radius:5px;font-family:inherit;font-size:12px;margin-bottom:7px;outline:none}
+    textarea{height:52px;resize:vertical}
+    input:focus,textarea:focus{border-color:#388bfd}
+    .btn-row{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+    button{padding:5px 12px;border:none;border-radius:5px;font-size:12px;cursor:pointer;font-family:inherit;font-weight:bold;transition:opacity .15s}
+    .btn-get{background:#238636;color:#fff}.btn-put{background:#1f6feb;color:#fff}.btn-del{background:#da3633;color:#fff}
+    .btn-neutral{background:#21262d;color:#8b949e;border:1px solid #30363d}
+    .btn-amber{background:#9e6a03;color:#fff}
+    .btn-stop{background:#6e3737;color:#ff7b72}
+    button:hover{opacity:.82}button:active{opacity:.65}
+    button:disabled{opacity:.35;cursor:not-allowed}
+
+    /* ── Node selector ── */
+    .node-sel{display:flex;gap:5px;margin-bottom:8px;flex-wrap:wrap}
+    .nsb{flex:1;min-width:40px;padding:4px 2px;border-radius:4px;border:1px solid #30363d;background:#010409;color:#8b949e;cursor:pointer;font-size:10px;text-align:center;font-family:inherit;font-weight:bold;transition:border-color .15s,color .15s}
+    .nsb:hover{border-color:#388bfd;color:#79c0ff}
+    .nsb.active{border-color:#388bfd;color:#79c0ff;background:#1c2433}
+    .nsb.nleader{border-color:#238636 !important;color:#3fb950 !important}
+    .nsb.ndown{opacity:.35;cursor:not-allowed}
+    .sel-label{font-size:10px;color:#484f58;margin-bottom:4px}
+
+    /* ── Response panel ── */
+    #response{background:#010409;border:1px solid #21262d;padding:10px;border-radius:5px;
+              min-height:300px;font-size:11px;white-space:pre-wrap;overflow-y:auto;
+              max-height:520px;line-height:1.65;color:#8b949e}
+    .resp-title-sub{font-size:10px;color:#6e7681;font-weight:normal;margin-left:8px}
+
+    /* ── Progress bar ── */
+    .pbwrap{background:#21262d;border-radius:3px;height:5px;margin:6px 0}
+    .pbfill{background:#238636;border-radius:3px;height:5px;width:0%;transition:width .2s}
+    #batch-status{font-size:11px;color:#8b949e;margin-top:3px;min-height:16px}
+
+    /* ── Bottom grid ── */
+    .main-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+    table{width:100%;border-collapse:collapse;font-size:12px}
+    th{background:#21262d;padding:5px 9px;text-align:left;color:#8b949e;font-weight:normal;border:1px solid #30363d}
+    td{padding:5px 9px;border:1px solid #21262d;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    tbody tr:hover{background:#21262d}.kv-wrap{max-height:200px;overflow-y:auto}
+    .log-panel{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px}
+    .log-panel h3{color:#58a6ff;margin-bottom:10px;font-size:13px;border-bottom:1px solid #21262d;padding-bottom:7px}
+    #log-entries{max-height:180px;overflow-y:auto;font-size:11px;line-height:1.9}
+    .log-entry{padding:1px 0;border-bottom:1px solid #21262d18}
+    .ts{color:#484f58;margin-right:8px}.ok{color:#3fb950}.err{color:#ff7b72}
+    .op-GET{color:#3fb950;font-weight:bold}.op-PUT{color:#79c0ff;font-weight:bold}
+    .op-DEL{color:#ff7b72;font-weight:bold}.op-BATCH{color:#d29922;font-weight:bold}
+    .ms{color:#484f58;margin-left:6px}
+
+    /* ── Animations ── */
+    @keyframes fadeIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+    .flash{animation:fadeIn .2s}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .spinner{display:inline-block;width:10px;height:10px;border:2px solid #484f58;border-top-color:#58a6ff;border-radius:50%;animation:spin .6s linear infinite;margin-right:6px}
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ Airi 分布式 KV 集群</h1>
+  <span class="badge" id="my-badge">节点 ? &middot; 初始化中&hellip;</span>
+</header>
+
+<!-- ── Cluster Cards ── -->
+<div class="cluster" id="cluster-cards"></div>
+
+<!-- ── Top Grid: 左=操作面板列 / 右=结果面板 ── -->
+<div class="top-grid">
+
+  <!-- 左列：KV 操作 + 批量测试 -->
+  <div class="ops-col">
+
+    <!-- KV 操作面板 -->
+    <div class="panel">
+      <h3>KV 操作</h3>
+      <div class="sel-label">发送到哪个节点：</div>
+      <div class="node-sel" id="node-sel"><!-- filled by JS --></div>
+      <input id="key-in" placeholder="键名 (Key)" onkeydown="if(event.key==='Enter')doGet()">
+      <textarea id="val-in" placeholder="Value（PUT 时填写）"></textarea>
+      <div class="btn-row">
+        <button class="btn-get"     onclick="doGet()">GET</button>
+        <button class="btn-put"     onclick="doPut()">PUT</button>
+        <button class="btn-del"     onclick="doDel()">DELETE</button>
+        <button class="btn-neutral" onclick="doReadAll()" title="读取所有节点，对比一致性">全节点读</button>
+      </div>
+    </div>
+
+    <!-- 批量写入面板 -->
+    <div class="panel">
+      <h3>批量写入测试</h3>
+      <div style="display:flex;gap:6px;margin-bottom:7px">
+        <input id="batch-prefix" placeholder="Key 前缀" style="flex:1;margin:0" value="bench">
+        <input id="batch-n" type="number" value="100" min="1" max="5000"
+               style="width:70px;margin:0;text-align:right">
+        <span style="line-height:31px;color:#8b949e;font-size:11px;padding-left:2px">条</span>
+      </div>
+      <div class="btn-row">
+        <button class="btn-put"    id="btn-batch-start" onclick="startBatch()">▶ 开始</button>
+        <button class="btn-stop"   id="btn-batch-stop"  onclick="stopBatch()" disabled>■ 停止</button>
+        <button class="btn-neutral" onclick="batchPreset(50)">×50</button>
+        <button class="btn-neutral" onclick="batchPreset(200)">×200</button>
+        <button class="btn-neutral" onclick="batchPreset(500)">×500</button>
+      </div>
+      <div class="pbwrap"><div class="pbfill" id="pbfill"></div></div>
+      <div id="batch-status">就绪</div>
+    </div>
+
+  </div><!-- /ops-col -->
+
+  <!-- 右列：操作结果面板 -->
+  <div class="panel" style="height:100%">
+    <h3>操作结果 <span class="resp-title-sub" id="resp-subtitle"></span>
+        <span style="float:right;font-size:10px;color:#484f58;cursor:pointer"
+              onclick="setResp('等待操作…',false,'')">清空</span>
+    </h3>
+    <pre id="response">等待操作…</pre>
+  </div>
+
+</div><!-- /top-grid -->
+
+<!-- ── Bottom: KV 表格 + 操作日志 ── -->
+<div class="main-grid">
+  <div class="panel">
+    <h3>KV Store
+      <span id="kv-count" style="color:#6e7681;font-size:11px;font-weight:normal"></span>
+      <span style="font-size:11px;color:#6e7681;float:right" id="scan-time"></span>
+    </h3>
+    <div class="kv-wrap"><table>
+      <thead><tr><th>Key</th><th>Value</th></tr></thead>
+      <tbody id="kv-body">
+        <tr><td colspan="2" style="color:#484f58;text-align:center">加载中…</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+  <div class="log-panel">
+    <h3>操作日志
+      <span onclick="document.getElementById('log-entries').innerHTML=''"
+            style="font-size:11px;color:#484f58;cursor:pointer;float:right">清空</span>
+    </h3>
+    <div id="log-entries"><span style="color:#484f58">暂无操作记录</span></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -79,13 +79,27 @@ extern Logger::LogLevel g_logLevel;
 inline Logger::LogLevel Logger::logLevel() { return g_logLevel; }
 
 // ── LOG_* 宏 ─────────────────────────────────────────────────────────────────
-// 注意：LOG_DEBUG 用 if 守卫，运行时跳过时不构造 Logger，用户消息不被求值（零开销）。
-// 其余级别无守卫，直接构造临时 Logger。
-#define LOG_DEBUG                                                                                   \
+// 设计要点（Day37 性能调优落地）：
+//   DEBUG / INFO / WARN 三档均带 `if (logLevel<=X)` 守卫。
+//   当当前日志级别高于该档时：
+//     1) Logger 对象不会被构造（避免 Impl ctor + LogContext::threadCtx 调用）
+//     2) operator<<(...) 链路上的所有参数与字符串拼接均不被求值（短路求值）
+//     3) __vfprintf / 字符串 append 等热点函数完全不会进入栈
+//   ERROR / FATAL 默认始终启用（且 FATAL 必须在用户表达式求值后调用 abort），
+//   故保留"无守卫"形态。
+//
+//   Day37 实测：仅给 LOG_INFO 加守卫，/health QPS 提升 ~30%（详见 dev-log/day37）。
+#define LOG_DEBUG                                                                                  \
     if (Logger::logLevel() <= Logger::DEBUG)                                                       \
     Logger(__FILE__, __LINE__, Logger::DEBUG).stream()
 
-#define LOG_INFO  Logger(__FILE__, __LINE__, Logger::INFO).stream()
-#define LOG_WARN  Logger(__FILE__, __LINE__, Logger::WARN).stream()
+#define LOG_INFO                                                                                   \
+    if (Logger::logLevel() <= Logger::INFO)                                                        \
+    Logger(__FILE__, __LINE__, Logger::INFO).stream()
+
+#define LOG_WARN                                                                                   \
+    if (Logger::logLevel() <= Logger::WARN)                                                        \
+    Logger(__FILE__, __LINE__, Logger::WARN).stream()
+
 #define LOG_ERROR Logger(__FILE__, __LINE__, Logger::ERROR).stream()
 #define LOG_FATAL Logger(__FILE__, __LINE__, Logger::FATAL).stream()

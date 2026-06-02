@@ -72,6 +72,16 @@ void HttpServer::addPrefixRoute(HttpRequest::Method method, const std::string &p
     prefixRoutes_.push_back(PrefixRoute{method, prefix, std::move(handler)});
 }
 
+void HttpServer::addAsyncRoute(HttpRequest::Method method, const std::string &path,
+                               AsyncRouteHandler handler) {
+    asyncRoutes_[makeRouteKey(method, path)] = std::move(handler);
+}
+
+void HttpServer::addAsyncPrefixRoute(HttpRequest::Method method, const std::string &prefix,
+                                     AsyncRouteHandler handler) {
+    asyncPrefixRoutes_.push_back(PrefixAsyncRoute{method, prefix, std::move(handler)});
+}
+
 // ── 新连接建立：为每条连接创建独立的 HttpContext ─────────────────────────────
 void HttpServer::onNewConnection(Connection *conn) {
     conn->setContext(HttpConnectionContext{limits_});
@@ -200,6 +210,20 @@ bool HttpServer::onRequest(Connection *conn, const HttpRequest &req) {
     HttpResponse resp(close);
 
     auto dispatch = [&]() {
+        // 优先异步路由（支持 chunked streaming / deferred 响应）
+        auto ait = asyncRoutes_.find(makeRouteKey(req.method(), req.url()));
+        if (ait != asyncRoutes_.end()) {
+            ait->second(req, &resp, conn);
+            return;
+        }
+        for (const auto &route : asyncPrefixRoutes_) {
+            if (route.method == req.method() &&
+                req.url().compare(0, route.prefix.size(), route.prefix) == 0) {
+                route.handler(req, &resp, conn);
+                return;
+            }
+        }
+        // 同步路由
         auto it = routes_.find(makeRouteKey(req.method(), req.url()));
         if (it != routes_.end()) {
             it->second(req, &resp);
@@ -225,6 +249,10 @@ bool HttpServer::onRequest(Connection *conn, const HttpRequest &req) {
         dispatch();
     };
     runChain();
+
+    // 异步 handler 已自行发送响应，跳过后续的同步序列化 + send
+    if (resp.isDeferred())
+        return true;
 
     // 可观测性：记录请求延迟和状态码
     HttpConnectionContext *ctx = conn->getContextAs<HttpConnectionContext>();

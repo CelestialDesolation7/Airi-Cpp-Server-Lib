@@ -46,6 +46,12 @@ class HttpServer {
     using Middleware =
         std::function<void(const HttpRequest &, HttpResponse *, const MiddlewareNext &)>;
 
+    // 异步路由：handler 接收 Connection* 以实现跳过同步发送。
+    // handler 调用 resp->setDeferred(true) 后，HttpServer 不再序列化发送 resp，
+    // 由 handler 自行在适当时机调用 conn->send()。
+    using AsyncRouteHandler =
+        std::function<void(const HttpRequest &, HttpResponse *, Connection *)>;
+
     HttpServer();
     explicit HttpServer(const Options &options);
     ~HttpServer() = default;
@@ -57,6 +63,14 @@ class HttpServer {
     void addRoute(HttpRequest::Method method, const std::string &path, RouteHandler handler);
     void addPrefixRoute(HttpRequest::Method method, const std::string &prefix,
                         RouteHandler handler);
+
+    // 异步路由：handler 收到 Connection* 以支持跳过同步发送。
+    // 与同步路由的区别：匹配到异步路由时，中间件已运行完毕（可向 resp 写入头），
+    //   handler 内调用 resp->setDeferred(true) 后可手动将 resp.headers() 拷贝进自定义头并直接发送。
+    void addAsyncRoute(HttpRequest::Method method, const std::string &path,
+                       AsyncRouteHandler handler);
+    void addAsyncPrefixRoute(HttpRequest::Method method, const std::string &prefix,
+                             AsyncRouteHandler handler);
 
     // 中间件链：按注册顺序执行，middleware 内部不调用 next() 可中断后续链路。
     void use(Middleware middleware) { middlewares_.emplace_back(std::move(middleware)); }
@@ -85,6 +99,12 @@ class HttpServer {
         RouteHandler handler;
     };
 
+    struct PrefixAsyncRoute {
+        HttpRequest::Method method{HttpRequest::Method::kInvalid};
+        std::string prefix;
+        AsyncRouteHandler handler;
+    };
+
     void onNewConnection(Connection *conn);
     void onMessage(Connection *conn);
     // 返回 true 表示连接可继续处理后续请求；false 表示已进入关闭流程。
@@ -104,6 +124,9 @@ class HttpServer {
     std::vector<Middleware> middlewares_;
     std::vector<PrefixRoute> prefixRoutes_;
     std::unordered_map<std::string, RouteHandler> routes_;
+
+    std::unordered_map<std::string, AsyncRouteHandler> asyncRoutes_;
+    std::vector<PrefixAsyncRoute> asyncPrefixRoutes_;
 
     HttpContext::Limits limits_{};
     double requestTimeoutSec_{15.0};

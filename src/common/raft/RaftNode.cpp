@@ -51,6 +51,11 @@ RaftNode::RaftNode(int id, std::vector<Peer> peers, uint16_t rpcPort)
         [this](const std::string &req, RpcServer::Done done) {
             handleInstallSnapshot(req, std::move(done));
         });
+    rpcServer_.addHandler(
+        "NodeAnnounce",
+        [this](const std::string &req, RpcServer::Done done) {
+            handleNodeAnnounce(req, std::move(done));
+        });
 }
 
 RaftNode::~RaftNode() { stop(); }
@@ -79,6 +84,9 @@ void RaftNode::start() {
                     log_.push_back(LogEntry{snapTerm, ""}); // 新哨兵
                     commitIndex_.store(snapIdx);
                     lastApplied_.store(snapIdx);
+                    // 将快照数据应用到状态机——必须在此处调用，否则重启后状态机为空。
+                    if (snapshotApplyCallback_)
+                        snapshotApplyCallback_(snapIdx, snapData);
                 }
 
                 // ③ 恢复快照点之后的日志条目
@@ -91,7 +99,51 @@ void RaftNode::start() {
                          << " snapshotIndex=" << snapshotIndex_
                          << " logSize=" << (log_.size() - 1) << " 条";
             }
+
+            // ── 冷启动检测：无持久化状态 = 首次启动 ────────────────────────
+            // 首次启动整集群时，所有节点都没有 Leader，不存在"重启节点抢主"问题，
+            // 无需宽限期，直接使用正常选举超时（150~300ms），让第一次选举快速完成。
+            // 反之，节点存在 term>0 或快照/日志 = 真正的重启 → 保留 grace 避免扰主。
+            bool freshStart = (currentTerm_.load() == 0
+                               && log_.size() == 1       // 只有哨兵条目
+                               && snapshotIndex_ == 0);
+            startupGrace_ = !freshStart;
+            if (freshStart) {
+                LOG_INFO << "[Node " << id_ << "] 冷启动（无持久化状态），跳过宽限期";
+            }
+
             resetElectionTimer();
+            // 上线广播：100ms 后向所有 peer 发 NodeAnnounce。
+            // 各 peer 收到后立即重置对本节点的连接退避时钟并尝试重连，
+            // 彻底消除"指数退避累积过长导致 Leader 迟迟无法发心跳"的问题。
+            // 100ms 延迟足以让 rpcServerThread_ 启动其 EventLoop 并开始 accept。
+            loop_.runAfter(0.1, [this] {
+                std::string body = json{{"nodeId", id_}}.dump();
+                for (const auto &peer : peers_) {
+                    if (peer.id == id_) continue;
+                    getOrCreateClient(peer)->callAsync(
+                        "NodeAnnounce", body,
+                        [id = id_, peerId = peer.id](bool ok, const std::string &) {
+                            if (ok)
+                                LOG_INFO << "[Node " << id << "] NodeAnnounce → Node "
+                                         << peerId << " 已送达";
+                        },
+                        /*timeoutMs=*/500);
+                }
+                LOG_INFO << "[Node " << id_ << "] 已向所有 peer 广播上线通知（NodeAnnounce）";
+            });
+            // 启动宽限期硬上限：30s 后无论是否收到 AE 都强制退出 grace。
+            // 仅在真正的节点重启（freshStart=false）时挂此定时器。
+            // 宽限期需足够长：手动重启场景下 Leader 的指数退避最长可累积到 ~13s
+            // （100ms→200→400→800→1600→3200→6400ms），30s 留有充足余量。
+            if (!freshStart) {
+                loop_.runAfter(30.0, [this] {
+                    if (startupGrace_) {
+                        LOG_INFO << "[Node " << id_ << "] 启动宽限期硬超时（30s），退出 grace";
+                        startupGrace_ = false;
+                    }
+                });
+            }
         });
         loop_.runEvery(0.05, [this] { heartbeatTick(); });
         loop_.loop();
@@ -170,6 +222,7 @@ void RaftNode::handleRequestVote(const std::string &reqJson, RpcServer::Done don
             votedFor_ = args.candidateId;  // 记录投票，本 term 内不再投给其他人
             // 收到合法投票请求后重置自己的选举计时器：
             // 既然已经有候选人在运作，就不要再发起竞争选举，让它先跑完。
+            startupGrace_ = false;  // 集群中已有候选人在动，退出启动宽限期
             resetElectionTimer();
             persistHardState();  // votedFor 变化必须立即落盘
             LOG_INFO << "[Node " << id_ << "] 已投票给节点 " << args.candidateId
@@ -204,6 +257,7 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
         // 收到有效 Leader 的消息：确认自己是 Follower
         state_.store(State::Follower);
         leaderId_ = args.leaderId;
+        startupGrace_ = false;  // 已感知现任 Leader，退出启动宽限期
         resetElectionTimer();  // 压制自己的选举超时
 
         // 规则②（一致性检查）：我的日志里是否存在 prevLogIndex 处的条目，且 term 匹配？
@@ -212,11 +266,24 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
         // 若这里不匹配，Follower 无法安全追加 entries，必须拒绝并给出冲突提示。
 
         // 快照点之前的条目已压缩，Leader 不应该再发 prevLogIndex < snapshotIndex_，
-        // 但防御性处理：视为已一致（Leader 应已发过 InstallSnapshot 覆盖了这部分）。
+        // 但如果由于 InstallSnapshot 和并发飞行的 AE 时序交错，确实收到了：
+        // 必须裁掉 entries 中 index <= snapshotIndex_ 的部分（已被快照覆盖），
+        // 但 index > snapshotIndex_ 的部分仍需正常追加，否则 follower 状态机
+        // 会永久落后这批 entries（leader 误以为成功后不再重传这部分）。
         if (args.prevLogIndex < snapshotIndex_) {
-            reply.success = true;
-            done(json(reply).dump());
-            return;
+            // 将 prevLogIndex 推到 snapshotIndex_，对应裁掉 entries 前缀
+            uint64_t skipN = snapshotIndex_ - args.prevLogIndex;
+            if (skipN >= args.entries.size()) {
+                // entries 全部已被快照覆盖，无需追加；仍然 ack 让 leader 推进 nextIndex
+                reply.success = true;
+                done(json(reply).dump());
+                return;
+            }
+            args.entries.erase(args.entries.begin(),
+                               args.entries.begin() + skipN);
+            args.prevLogIndex = snapshotIndex_;
+            args.prevLogTerm  = snapshotTerm_;
+            // 继续走下面的正常追加 + commit 推进流程
         }
         if (args.prevLogIndex > lastLogIndex()) {
             // Follower 日志太短，根本没有 prevLogIndex 处的条目
@@ -297,6 +364,7 @@ void RaftNode::handleInstallSnapshot(const std::string &reqJson, RpcServer::Done
 
         state_.store(State::Follower);
         leaderId_ = args.leaderId;
+        startupGrace_ = false;  // 已感知到现任 Leader，退出启动宽限期
         resetElectionTimer();
 
         // 快照比我现有的更旧：忽略（避免状态倒退）
@@ -338,6 +406,10 @@ void RaftNode::handleInstallSnapshot(const std::string &reqJson, RpcServer::Done
             persistHardState();
         }
 
+        // 通知状态机用快照数据重建自身状态
+        if (snapshotApplyCallback_)
+            snapshotApplyCallback_(snapshotIndex_, snapshotData_);
+
         done(json(reply).dump());
     });
 }
@@ -350,6 +422,11 @@ void RaftNode::becomeFollower(uint64_t term) {
     if (state_.load() != State::Follower)
         LOG_INFO << "[Node " << id_ << "] " << stateName(state_.load()) << " → 跟随者（任期="
                  << term << "）";
+    // 丢失 Leader 身份：将所有未完成的写请求全部通知失败
+    if (!writeCallbacks_.empty()) {
+        for (auto &[idx, cb] : writeCallbacks_) cb(false, idx);
+        writeCallbacks_.clear();
+    }
     state_.store(State::Follower);
     currentTerm_.store(term);
     votedFor_ = -1;
@@ -358,6 +435,11 @@ void RaftNode::becomeFollower(uint64_t term) {
 }
 
 void RaftNode::becomeCandidate() {
+    // 以防万一：如果以 Leader 身份进入候选（理论上不应发生），同样清空写回调
+    if (!writeCallbacks_.empty()) {
+        for (auto &[idx, cb] : writeCallbacks_) cb(false, idx);
+        writeCallbacks_.clear();
+    }
     // 【Raft 规则 §5.2】发起新选举时必须先递增自己的 term。
     // 这防止旧的投票响应（来自网络延迟）污染新一轮选举：
     // 旧回包的 term 不等于新 term，会在 onVoteReply 里被过滤掉。
@@ -375,6 +457,7 @@ void RaftNode::becomeCandidate() {
 void RaftNode::becomeLeader() {
     state_.store(State::Leader);
     leaderId_ = id_;
+    startupGrace_ = false;  // 已为 Leader，后续不再需启动宽限期
     LOG_INFO << "[Node " << id_ << "] *** 成为领导者，任期=" << currentTerm_.load() << " ***";
     ++electionEpoch_;
 
@@ -398,11 +481,12 @@ void RaftNode::resetElectionTimer() {
     // 每次 reset 都递增 epoch，旧定时器触发时发现 epoch 不匹配就自动放弃。
     ++electionEpoch_;
     uint64_t myEpoch = electionEpoch_;  // 捕获当前 epoch 进 lambda
-    // 随机化超时（150~300ms）是 Raft 避免同时选举的关键机制：
-    // 如果所有节点超时相同，它们会在同一时刻都发起选举，导致无休止的平票。
-    // 随机化后，最快超时的节点抢先发起，其他节点收到它的 RequestVote 后重置计时器，
-    // 大概率只有一个节点真正进入 Candidate 状态。
-    int timeoutMs = std::uniform_int_distribution<int>(150, 300)(rng_);
+    // 选举超时随机化（1500~3000ms 启动宽限期 / 150~300ms 稳态期）。启动宽限期避免
+    // 一台重启节点在未听到 Leader 心跳前起初始选举超时 → 调高 term 抢走 Leader
+    // 身份。启动宽限期 ≥ 2× 稳态期上限，保证 50ms 心跳足以在该窗口内到达。
+    int timeoutMs = startupGrace_
+        ? std::uniform_int_distribution<int>(1500, 3000)(rng_)
+        : std::uniform_int_distribution<int>(150, 300)(rng_);
     loop_.runAfter(timeoutMs / 1000.0,
                    [this, myEpoch] { electionTimerFired(myEpoch); });
 }
@@ -413,6 +497,17 @@ void RaftNode::electionTimerFired(uint64_t epoch) {
     if (epoch != electionEpoch_) return;
     // 守卫②：如果自己已经是 Leader，不应再发起选举（正常不会走到这里，双重保险）。
     if (state_.load() == State::Leader) return;
+    // 守卫③：启动宽限期内绝不主动发起选举。
+    // 理由：一台刚重启的节点（尤其是上一任 Leader）log_ 可能比当前新 Leader 还长，
+    // 一旦 term++ 抬高任期 → 现任 Leader 被 §5.1 强制 step down → 重新比较 log →
+    // 落后但日志更长的旧 Leader 反而当选，造成可见的「重启节点高概率抢主」。
+    // grace 内只 reset timer 不发选举；正常 50ms 心跳会很快到达并清掉 grace。
+    // 兜底：start() 时挂了一次性 5s 定时器，避免冷启动整集群都在 grace 卡死。
+    if (startupGrace_) {
+        LOG_INFO << "[Node " << id_ << "] 选举超时但仍在启动宽限期内，抑制本次选举";
+        resetElectionTimer();
+        return;
+    }
     // 选举超时 = Leader 失联（可能宕机或网络分区）。转为候选人，发起新一轮选举。
     becomeCandidate();
     runElection(); // 为每个 peer 并发发射 collectVote 协程
@@ -486,6 +581,68 @@ FireAndForget RaftNode::collectVote(uint64_t electionTerm, Peer peer) {
                  << " 的选票（已得票=" << currentElectionVotes_ << "/" << quorum_ << "，需要=" << quorum_ << "）";
         if (currentElectionVotes_ >= quorum_) becomeLeader();
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §4b NodeAnnounce：重启上线通知
+//
+// 重启节点在 start() 后 100ms 广播此消息；接收方重置对发送方的
+// AsyncRpcClient 退避时钟并触发立即重连，消除指数退避造成的重连延迟。
+// ════════════════════════════════════════════════════════════════════════════
+
+void RaftNode::handleNodeAnnounce(const std::string &reqJson, RpcServer::Done done) {
+    int senderId = -1;
+    try {
+        senderId = json::parse(reqJson).at("nodeId").get<int>();
+    } catch (...) {
+        done(R"({})");
+        return;
+    }
+
+    loop_.runInLoop([this, senderId, done = std::move(done)]() mutable {
+        done(R"({})");  // 立即回复，无需等待
+        // 找到对应 peer，唤醒其出站客户端
+        for (const auto &peer : peers_) {
+            if (peer.id == senderId) {
+                LOG_INFO << "[Node " << id_ << "] 收到 Node " << senderId
+                         << " 的重上线通知（NodeAnnounce），重置连接退避并立即重连";
+                getOrCreateClient(peer)->wakeUp();
+                break;
+            }
+        }
+        // ── 多数派同时启动：抢占式退出 startupGrace_ ──────────────────
+        // 当 --persist 且磁盘有非零 term 时，freshStart=false → startupGrace_=true，
+        // 选举超时被拉长到 1500–3000ms 以保护"潜在仍存活的旧 Leader"。
+        // 但若多个节点同时冷启动（无任何 Leader 在线），grace 会持续重置，
+        // 直到 30s 硬上限才有节点突然成为 Leader（用户观感：迟迟不发选举）。
+        // 修复：在 grace 期间统计已收到 NodeAnnounce 的 peers，一旦
+        // (announcedPeers_.size() + 1) 达到 quorum 且本节点仍未听到 Leader，
+        // 推断"多数派同时启动"，立即退出 grace 并触发 50ms 选举。
+        if (startupGrace_ && leaderId_ == -1 && state_.load() == State::Follower) {
+            announcedPeers_.insert(senderId);
+            if (static_cast<int>(announcedPeers_.size()) + 1 >= quorum_) {
+                LOG_INFO << "[Node " << id_ << "] 已收到 " << announcedPeers_.size()
+                         << " 个 peer 的上线通知（含自己 = quorum），"
+                         << "推断多数派同时启动，提前退出 startupGrace_ 并发起选举";
+                startupGrace_ = false;
+                announcedPeers_.clear();
+                ++electionEpoch_;
+                uint64_t ep = electionEpoch_;
+                loop_.runAfter(0.05, [this, ep] { electionTimerFired(ep); });
+                return;
+            }
+        }
+        // 冷启动场景加速选举：
+        // 若当前是 Follower 且无已知 Leader（leaderId_==-1），说明集群尚无主节点。
+        // 收到任意 peer 上线通知后，立即抢占一个 50ms 快速选举机会，
+        // 而不是干等当前 election timer 的剩余时间（最多 300ms）。
+        // 保留 epoch 守卫，不会与正在进行中的选举冲突。
+        if (state_.load() == State::Follower && leaderId_ == -1 && !startupGrace_) {
+            ++electionEpoch_;
+            uint64_t ep = electionEpoch_;
+            loop_.runAfter(0.05, [this, ep] { electionTimerFired(ep); });
+        }
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -661,12 +818,40 @@ void RaftNode::applyCommitted() {
         LOG_INFO << "[Node " << id_ << "] 应用日志 index=" << idx
                  << " 命令=" << logAt(idx).cmd;
         if (applyCallback_) applyCallback_(idx, logAt(idx).cmd);
+        // 如果有等待应用的写回调，处理完成后通知
+        auto it = writeCallbacks_.find(idx);
+        if (it != writeCallbacks_.end()) {
+            it->second(true, it->first);
+            writeCallbacks_.erase(it);
+        }
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // §7  外部写入接口：propose
 // ════════════════════════════════════════════════════════════════════════════
+
+void RaftNode::proposeAndNotify(const std::string &cmd, std::function<void(bool, uint64_t)> done) {
+    // 线程安全：实际工作在 loop_ 线程执行。
+    // done(true, idx)  = 命令已应用到状态机，idx 是被分配的全局日志下标
+    // done(false, idx) = 丢失 Leader 身份（idx 为该条目被分配的下标，未分配时为 0）
+    loop_.runInLoop([this, cmd, done = std::move(done)]() mutable {
+        if (state_.load() != State::Leader) {
+            done(false, 0);
+            return;
+        }
+        log_.push_back(LogEntry{currentTerm_.load(), cmd});
+        persistLog();
+        uint64_t idx = lastLogIndex();
+        LOG_INFO << "[Node " << id_ << "] proposeAndNotify 追加日志 index=" << idx
+                 << " cmd=" << cmd;
+        writeCallbacks_[idx] = std::move(done);
+        for (const auto &peer : peers_) {
+            if (peer.id == id_) continue;
+            replicateLog(peer);
+        }
+    });
+}
 
 void RaftNode::propose(const std::string &cmd) {
     // propose 可以从任意线程调用（线程安全）。
@@ -721,10 +906,27 @@ void RaftNode::persistLog() {
 // 压缩后 log_ 只保留快照点之后的条目，大幅减少内存占用和重启恢复时间。
 // ════════════════════════════════════════════════════════════════════════════
 
-void RaftNode::takeSnapshot(const std::string &data) {
-    loop_.runInLoop([this, data] {
-        uint64_t snapIdx = lastApplied_.load();
+void RaftNode::takeSnapshot(uint64_t appliedIndex, const std::string &data) {
+    // ── 关键：snapIdx 必须使用调用方在生成 data 时捕获的 appliedIndex ──────
+    // 不能在 lambda 内取 lastApplied_.load()。因为 takeSnapshot 通常从
+    // applyCallback 中调用，而 applyCallback 自身位于 applyCommitted 的
+    // while 循环中；本 lambda 走 queueInLoop（loop_ 的 tid 在构造线程捕获，
+    // 异步排队），真正执行时 lastApplied_ 已被推进到 appliedIndex+k，
+    // 而 data 仍是 state@appliedIndex。这种错位会让 saveSnapshot 写入
+    // (lastIndex=appliedIndex+k, data=state@appliedIndex)，重启后
+    // snapshotApplyCallback 用旧数据恢复状态机但 lastApplied_ 跳到 +k，
+    // 中间 k 条 apply 永久丢失（用户观测到的 "kv 总数变少" 即此原因）。
+    loop_.runInLoop([this, appliedIndex, data] {
+        uint64_t snapIdx = appliedIndex;
         if (snapIdx <= snapshotIndex_) return; // 没有新的 apply，无需压缩
+        // 安全护栏：appliedIndex 不应超过 lastApplied_（调用方传错时拒绝）
+        if (snapIdx > lastApplied_.load()) {
+            LOG_WARN << "[Node " << id_ << "] takeSnapshot 拒绝：appliedIndex="
+                     << snapIdx << " 超过 lastApplied=" << lastApplied_.load();
+            return;
+        }
+        // 同样要保证 snapIdx 在当前 log_ 范围内（被覆盖写或截断的极端情况）
+        if (snapIdx > lastLogIndex()) return;
 
         uint64_t snapTerm = logAt(snapIdx).term;
 

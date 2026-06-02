@@ -210,6 +210,22 @@ add_executable(lb_demo examples/src/lb_demo.cpp)
 target_link_libraries(lb_demo NetLib pthread)
 set_target_properties(lb_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
 
+# ── 分布式 KV 存储节点 ────────────────────────────────────────────────────────
+set(KV_SOURCES
+    examples/src/kv/KvStateMachine.cpp
+    examples/src/kv/KvHttpServer.cpp
+    examples/src/kv_node.cpp
+)
+if(MCPP_HAS_ROCKSDB)
+    list(APPEND KV_SOURCES examples/src/kv/RocksKvStore.cpp)
+endif()
+
+add_executable(kv_node ${KV_SOURCES})
+target_include_directories(kv_node PRIVATE examples/include)
+target_link_libraries(kv_node NetLib pthread)
+set_target_properties(kv_node PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
+
+
 
 if(ZLIB_FOUND)
     target_link_libraries(http_server ZLIB::ZLIB)

@@ -22,6 +22,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace raft {
@@ -47,6 +48,8 @@ class RaftNode {
     uint64_t getCurrentTerm() const { return currentTerm_.load(); }
     bool     isLeader() const { return state_.load() == State::Leader; }
     int      getId() const { return id_; }
+    int      getPeerCount() const { return static_cast<int>(peers_.size()); } // 集群总节点数（含自己）
+    int      getQuorum() const { return quorum_; }
     uint64_t getCommitIndex() const { return commitIndex_.load(); }
     uint64_t getLastApplied() const { return lastApplied_.load(); }
     int      getLeaderId() const { return leaderId_; }  // -1 = 未知
@@ -68,9 +71,13 @@ class RaftNode {
     }
 
     // ── 日志压缩（可从任意线程调用；实际执行在 loop_ 线程）──────────────
+    // appliedIndex：data 对应的 lastApplied 快照点（state machine 已 apply 到此）。
+    //              必须由调用方在生成 data 的同一时刻捕获，避免与 loop_ 内
+    //              异步执行时已被推进的 lastApplied_ 错配（错配会导致重启后
+    //              snapshotIndex 跳过若干 apply，状态机数据缺失）。
     // data：状态机快照序列化结果（对 Raft 透明）。
     // 调用后 log_ 中快照点之前的条目会被删除，对落后 peer 改发 InstallSnapshot。
-    void takeSnapshot(const std::string &data);
+    void takeSnapshot(uint64_t appliedIndex, const std::string &data);
 
     // ── 状态机回调（必须在 start() 之前注册）────────────────────────────
     // 当 lastApplied 推进时，在 loop_ 线程回调 cb(index, cmd)。
@@ -78,11 +85,28 @@ class RaftNode {
         applyCallback_ = std::move(cb);
     }
 
+    // ── 快照安装回调（必须在 start() 之前注册）──────────────────────────
+    // 当收到 Leader 发来的 InstallSnapshot 并安装完毕时，在 loop_ 线程回调
+    // cb(lastIncludedIndex, snapshotData)，让状态机用快照数据重建状态。
+    void setSnapshotApplyCallback(
+        std::function<void(uint64_t, const std::string &)> cb) {
+        snapshotApplyCallback_ = std::move(cb);
+    }
+
+    // ── 带完成通知的写入接口（线程安全）─────────────────────────────────
+    // 与 propose() 相同，但在命令被 apply 到状态机后回调 done(true)。
+    // 若当前节点不是 Leader，立即回调 done(false)。
+    // 若在 apply 前丢失 Leader 身份，同样回调 done(false, 0)。
+    // 第二个参数 logIndex 是该命令被分配到的全局日志下标（失败时为 0）。
+    void proposeAndNotify(const std::string &cmd, std::function<void(bool, uint64_t)> done);
+
   private:
     // ── RPC server 回调（由 sub-reactor 线程调用，内部异步投递到 loop_）──
     void handleRequestVote(const std::string &reqJson, RpcServer::Done done);
     void handleAppendEntries(const std::string &reqJson, RpcServer::Done done);
     void handleInstallSnapshot(const std::string &reqJson, RpcServer::Done done);
+    // 重启上线通知：对端广播自己已就绪，接收方重置对其的连接退避时钟
+    void handleNodeAnnounce(const std::string &reqJson, RpcServer::Done done);
 
     // ── 以下所有方法都必须在 loop_ 线程执行 ─────────────────────────
     void becomeFollower(uint64_t term);
@@ -135,6 +159,15 @@ class RaftNode {
     int                   leaderId_{-1};
     int                   currentElectionVotes_{0};
     uint64_t              electionEpoch_{0};
+    // 启动宽限期：节点刚起动时用加长的选举超时，避免一台重启节点立刻调高 term
+    // 抢走现有健康 Leader 的身份。任何“已感知集群”的事件（收到 Leader 的
+    // AppendEntries / 向其他候选人授出票）后切换为正常 150~300ms 超时。
+    bool                  startupGrace_{true};
+    // 已收到 NodeAnnounce 的 peer id 集合（仅 grace 期间记录）。
+    // 当 announcedPeers_.size() + 1 达到 quorum 且本节点仍未听到 Leader，
+    // 表示整个多数派正在同时启动、集群中不存在在任 Leader，
+    // 可提前退出 grace 并立即发起选举，避免"全集群同时重启需等 30s"。
+    std::unordered_set<int> announcedPeers_;
 
     // ── 日志复制状态 ────────────────────────────────────────────────────
     std::atomic<uint64_t> commitIndex_{0};  // 已提交的最高 index
@@ -157,6 +190,10 @@ class RaftNode {
 
     // 状态机回调：commit 推进时在 loop_ 线程回调
     std::function<void(uint64_t, const std::string &)> applyCallback_;
+    // 快照安装回调：InstallSnapshot 完成后在 loop_ 线程回调
+    std::function<void(uint64_t, const std::string &)> snapshotApplyCallback_;
+    // 等待 apply 的写回调：logIndex → done(ok)（仅在 loop_ 线程访问，无需加锁）
+    std::unordered_map<uint64_t, std::function<void(bool, uint64_t)>> writeCallbacks_;
 
     // ── 基础设施 ────────────────────────────────────────────────────────
     Eventloop         loop_;
