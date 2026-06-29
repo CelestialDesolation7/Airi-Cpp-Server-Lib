@@ -3,17 +3,16 @@
 # 并对未在编译数据库中的文件（如未启用 MCPP_ENABLE_COROUTINES 时的 async/*.h、
 # 未启用 MCPP_ENABLE_IO_URING 时的 io_uring 文件等）提供合理的回退编译参数。
 #
-# ⚠️ 关键修复（Xcode 26 / AppleClang 21 + Homebrew clangd 22）：
-#   Homebrew clangd 默认用自带的 resource-dir（clang/22/include），其中的
-#   <string.h>/<stddef.h> wrapper 与 Apple SDK 的 libc++ v1 不匹配，触发
-#   `<cstring> tried including <string.h> but didn't find libc++'s` 报错。
-#   通过 -resource-dir 显式指向 AppleClang 21 的内建头目录即可解决。
+# 说明：本机使用 Apple Command Line Tools 自带的 clangd（/usr/bin/clangd, clang 17），
+#   compile_commands.json 中的编译器同样为 /usr/bin/c++（同一套工具链），
+#   因此 clangd 默认的 resource-dir 已与构建工具链匹配，无需 -resource-dir 覆盖。
+#   （此前硬编码的 Xcode/AppleClang 21 路径在本机不存在，会导致 clangd 找不到
+#    标准库头文件，从而产生大量假错误并破坏后台索引 / 查找引用功能。）
 CompileFlags:
   CompilationDatabase: build
   Add:
     - -std=c++20
     - -Wno-unknown-warning-option
-    - -resource-dir=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21
 Index:
   Background: Build
 Diagnostics:

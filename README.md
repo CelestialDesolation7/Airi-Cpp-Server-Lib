@@ -67,6 +67,60 @@ curl -H "Accept-Encoding: gzip" -i http://127.0.0.1:8080/static/index.html  # 20
 
 ---
 
+## IDE 配置（任意 macOS / Linux 机器上正确解析）
+
+本项目使用 **clangd** 作为统一的 C++ 语言服务器（跳转、补全、查找引用、实时诊断）。
+要让任意机器 clone 后都能正确解析，只需理解一件事：
+
+> **`compile_commands.json` 记录的是本机绝对路径，不随仓库提交（已 `.gitignore`）。
+> 任何新机器都必须先在本地 configure 一次来生成它，clangd 才能工作。**
+
+### 一键准备
+
+```bash
+git clone <this-repo> && cd Airi-Cpp-Server-Lib
+./scripts/setup_ide.sh          # 检查 cmake/clangd，configure 并生成 compile_commands.json
+# 然后在 VS Code 重启 clangd：Cmd/Ctrl+Shift+P → "clangd: Restart language server"
+```
+
+任何一次 `cmake -S . -B build`（或 VS Code 的 `cmake:configure` 任务、`./scripts/setup_ide.sh`）
+都会重新生成 `build/compile_commands.json` 并同步一份到仓库根目录，IDE 解析随即恢复。
+
+### 前置依赖
+
+| 工具 | macOS | Linux |
+| --- | --- | --- |
+| CMake ≥ 3.21 | `brew install cmake` | `sudo apt install cmake` |
+| clangd | 自带于 CommandLineTools（`xcode-select --install`）或 `brew install llvm` | `sudo apt install clangd`（或 `clangd-<ver>`） |
+| VS Code 扩展 | `llvm-vs-code-extensions.vscode-clangd` | 同左 |
+
+> ⚠️ 不要同时启用微软 **C/C++ (cpptools)** 的 IntelliSense 引擎，会与 clangd 双重诊断冲突。
+> 仓库 `.vscode/settings.json` 已设 `"C_Cpp.intelliSenseEngine": "disabled"`，cpptools 仅保留调试功能。
+
+### 跨平台是怎么保证的
+
+仓库内的配置已经做到“零硬编码、跟随本机工具链”，无需手动改任何路径：
+
+- **`.clangd`** — 只声明 `CompilationDatabase: build` 和 `-std=c++20`，**不再硬编码任何
+  `-resource-dir`**。系统头文件路径完全交给 clangd 自动发现。
+- **`.vscode/settings.json` 的 `--query-driver`** — 让 clangd 直接“询问”
+  `compile_commands.json` 里记录的真实编译器（mac 的 AppleClang / Homebrew clang，
+  Linux 的 gcc / clang 都覆盖），自动拿到该机器**正确**的 SDK 头文件与 resource-dir。
+  这样换机器、换编译器版本都不需要改配置。
+- **`CMakeLists.txt`** — `CMAKE_EXPORT_COMPILE_COMMANDS ON` + `sync_compile_commands`
+  目标，保证每次 configure/build 都把最新的编译数据库同步到根目录。
+
+### 常见问题
+
+- **满屏假错误 / 找不到 `<string>` 等标准头**：通常是 `compile_commands.json` 缺失或过期。
+  重跑 `./scripts/setup_ide.sh` 后重启 clangd。
+- **"查找所有引用" 找不到结果**：后台索引尚未建好或索引缓存损坏。删除 `build/.cache/clangd`
+  后重启 clangd，等状态栏索引进度跑完即可。
+- **以前在某台机器上手动加过 `-resource-dir`**：不要再加。除非你的 `<cstring> tried including
+  <string.h>` 类报错确实复现，且 `-resource-dir` 指向 `clang --print-resource-dir` 输出的**真实存在**路径。
+
+---
+
 ## 目录结构
 
 ```

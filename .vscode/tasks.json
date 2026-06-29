@@ -3,15 +3,11 @@
   //
   // 构建任务
   //   cmake:configure  →  build:all（NetLib + http_server + kv_node + conn_scale_test）
-  //                    →  build:lib / build:example / build:kv / build:bench（单目标增量构建）
   //
   // 运行 / 压测任务
-  //   run:server        ← build:example
-  //   bench:wrk         （需先 run:server）
+  //   run:server        ← build:all
   //   bench:wrk-ramp    （需先 run:server）
-  //   bench:wrk+rss     ← build:all → 脚本自动拉起并停服
-  //   bench:flamegraph  ← build:example
-  //   bench:instruments ← build:example（macOS，需 sudo）
+  //   bench:instruments ← build:all（macOS，需 sudo）
   //
   // 清理任务
   //   clean:incremental  删编译产物，保留 CMakeCache（无需重新 configure）
@@ -26,154 +22,138 @@
   },
   "tasks": [
     {
-      "label": "cmake:configure",
-      "type": "shell",
-      "command": "cmake",
-      "args": ["-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Release"],
-      "problemMatcher": [],
-      "presentation": { "reveal": "silent", "panel": "shared", "clear": false },
-      "detail": "生成 build/ 目录与 compile_commands.json"
+        "label": "cmake:configure",
+        "type": "shell",
+        "command": "cmake",
+        "args": [
+            "-S",
+            ".",
+            "-B",
+            "build",
+            "-DCMAKE_BUILD_TYPE=Release"
+        ],
+        "problemMatcher": [],
+        "presentation": {
+            "reveal": "silent",
+            "panel": "shared",
+            "clear": false
+        },
+        "detail": "生成 build/ 目录与 compile_commands.json"
     },
     {
-      "label": "build:lib",
-      "type": "shell",
-      "command": "cmake",
-      "args": ["--build", "build", "--target", "NetLib", "-j"],
-      "dependsOn": ["cmake:configure"],
-      "group": "build",
-      "problemMatcher": ["$gcc"],
-      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
-      "detail": "只编译网络库本体（输出 build/libAiri-Cpp-Server-Lib.a）"
+        "label": "build:all",
+        "type": "shell",
+        "command": "cmake",
+        "args": [
+            "--build",
+            "build",
+            "--target",
+            "NetLib",
+            "http_server",
+            "kv_node",
+            "conn_scale_test",
+            "-j"
+        ],
+        "dependsOn": [
+            "cmake:configure"
+        ],
+        "group": {
+            "kind": "build",
+            "isDefault": true
+        },
+        "problemMatcher": [
+            "$gcc"
+        ],
+        "presentation": {
+            "reveal": "always",
+            "panel": "shared",
+            "clear": true
+        },
+        "detail": "单次 cmake 调用并行构建库 + http_server + kv_node + 压测工具（消除多进程竞争）"
     },
     {
-      "label": "build:example",
-      "type": "shell",
-      "command": "cmake",
-      "args": ["--build", "build", "--target", "http_server", "-j"],
-      "dependsOn": ["cmake:configure"],
-      "group": "build",
-      "problemMatcher": ["$gcc"],
-      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
-      "detail": "编译 examples/ 目录的示例服务器（隐式触发 NetLib）"
+        "label": "run:server",
+        "type": "shell",
+        "command": "./build/examples/http_server",
+        "dependsOn": [
+            "build:all"
+        ],
+        "isBackground": false,
+        "problemMatcher": [],
+        "presentation": {
+            "reveal": "always",
+            "panel": "dedicated",
+            "clear": true
+        },
+        "detail": "前台运行示例服务器（监听 ${env:MYCPPSERVER_BIND_PORT}），Ctrl+C 退出"
     },
     {
-      "label": "build:kv",
-      "type": "shell",
-      "command": "cmake",
-      "args": ["--build", "build", "--target", "kv_node", "-j"],
-      "dependsOn": ["cmake:configure"],
-      "group": "build",
-      "problemMatcher": ["$gcc"],
-      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
-      "detail": "编译 Raft KV 节点（输出 build/examples/kv_node）"
+        "label": "bench:wrk-ramp",
+        "type": "shell",
+        "command": "bash",
+        "args": [
+            "-c",
+            "URL=http://127.0.0.1:${MYCPPSERVER_BIND_PORT}/; for C in 10 50 200 500 1000 2000; do echo \"=== connections=$C ===\"; wrk -t4 -c$C -d20s --latency $URL; sleep 5; done"
+        ],
+        "problemMatcher": [],
+        "presentation": {
+            "reveal": "always",
+            "panel": "dedicated",
+            "clear": true
+        },
+        "detail": "阶梯加压：10→50→200→500→1000→2000 并发，每档 20s，观察吞吐拐点与延迟膝点"
     },
     {
-      "label": "build:bench",
-      "type": "shell",
-      "command": "cmake",
-      "args": ["--build", "build", "--target", "conn_scale_test", "-j"],
-      "dependsOn": ["cmake:configure"],
-      "group": "build",
-      "problemMatcher": ["$gcc"],
-      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
-      "detail": "编译 RSS / 长连接规模压测工具（输出 build/tools/conn_scale_test）"
+        "label": "clean:incremental",
+        "type": "shell",
+        "command": "cmake",
+        "args": [
+            "--build",
+            "build",
+            "--target",
+            "clean"
+        ],
+        "problemMatcher": [],
+        "presentation": {
+            "reveal": "silent",
+            "panel": "shared",
+            "clear": false
+        },
+        "detail": "删除编译产物，保留 CMakeCache / Makefile（无需重新 configure）"
     },
     {
-      "label": "build:all",
-      "type": "shell",
-      "command": "cmake",
-      "args": [
-        "--build", "build",
-        "--target", "NetLib", "http_server", "kv_node", "conn_scale_test",
-        "-j"
-      ],
-      "dependsOn": ["cmake:configure"],
-      "group": { "kind": "build", "isDefault": true },
-      "problemMatcher": ["$gcc"],
-      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
-      "detail": "单次 cmake 调用并行构建库 + http_server + kv_node + 压测工具（消除多进程竞争）"
+        "label": "clean:reconfigure",
+        "type": "shell",
+        "command": "bash",
+        "args": [
+            "-c",
+            "rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release"
+        ],
+        "problemMatcher": [],
+        "presentation": {
+            "reveal": "always",
+            "panel": "shared",
+            "clear": true
+        },
+        "detail": "完整清理并重新 configure（一键恢复干净状态）"
     },
     {
-      "label": "run:server",
-      "type": "shell",
-      "command": "./build/examples/http_server",
-      "dependsOn": ["build:example"],
-      "isBackground": false,
-      "problemMatcher": [],
-      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
-      "detail": "前台运行示例服务器（监听 ${env:MYCPPSERVER_BIND_PORT}），Ctrl+C 退出"
-    },
-    {
-      "label": "bench:wrk",
-      "type": "shell",
-      "command": "bash",
-      "args": [
-        "-c",
-        "wrk -t4 -c100 -d60s --latency http://127.0.0.1:${MYCPPSERVER_BIND_PORT}/"
-      ],
-      "problemMatcher": [],
-      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
-      "detail": "对已运行的服务器执行 60s wrk 压测（4 线程 / 100 并发），需服务器已启动"
-    },
-    {
-      "label": "bench:wrk-ramp",
-      "type": "shell",
-      "command": "bash",
-      "args": [
-        "-c",
-        "URL=http://127.0.0.1:${MYCPPSERVER_BIND_PORT}/; for C in 10 50 200 500 1000 2000; do echo \"=== connections=$C ===\"; wrk -t4 -c$C -d20s --latency $URL; sleep 5; done"
-      ],
-      "problemMatcher": [],
-      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
-      "detail": "阶梯加压：10→50→200→500→1000→2000 并发，每档 20s，观察吞吐拐点与延迟膝点"
-    },
-    {
-      "label": "clean:incremental",
-      "type": "shell",
-      "command": "cmake",
-      "args": ["--build", "build", "--target", "clean"],
-      "problemMatcher": [],
-      "presentation": { "reveal": "silent", "panel": "shared", "clear": false },
-      "detail": "删除编译产物，保留 CMakeCache / Makefile（无需重新 configure）"
-    },
-    {
-      "label": "clean:reconfigure",
-      "type": "shell",
-      "command": "bash",
-      "args": ["-c", "rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release"],
-      "problemMatcher": [],
-      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
-      "detail": "完整清理并重新 configure（一键恢复干净状态）"
-    },
-    {
-      "label": "bench:wrk+rss",
-      "type": "shell",
-      "command": "bash",
-      "args": ["${workspaceFolder}/scripts/bench.sh"],
-      "dependsOn": ["build:all"],
-      "problemMatcher": [],
-      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
-      "detail": "后台拉起示例服务器 → wrk 30s 压测 → RSS 长连接测试 → 自动停服"
-    },
-    {
-      "label": "bench:flamegraph",
-      "type": "shell",
-      "command": "bash",
-      "args": ["${workspaceFolder}/scripts/flamegraph.sh"],
-      "dependsOn": ["build:example"],
-      "problemMatcher": [],
-      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
-      "detail": "wrk 加压 + sample/perf 采样 10s，输出火焰图原始栈到 benchmark/flamegraph/"
-    },
-    {
-      "label": "bench:instruments",
-      "type": "shell",
-      "command": "bash",
-      "args": ["${workspaceFolder}/scripts/instruments_profile.sh"],
-      "dependsOn": ["build:example"],
-      "problemMatcher": [],
-      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
-      "detail": "macOS xctrace 录制 30s wrk 压测下 CPU 采样，产物为 .trace（双击用 Instruments 打开）。需 sudo。"
+        "label": "bench:instruments",
+        "type": "shell",
+        "command": "bash",
+        "args": [
+            "${workspaceFolder}/scripts/instruments_profile.sh"
+        ],
+        "dependsOn": [
+            "build:all"
+        ],
+        "problemMatcher": [],
+        "presentation": {
+            "reveal": "always",
+            "panel": "dedicated",
+            "clear": true
+        },
+        "detail": "macOS xctrace 录制 30s wrk 压测下 CPU 采样，产物为 .trace（双击用 Instruments 打开）。需 sudo。"
     }
-  ]
+]
 }

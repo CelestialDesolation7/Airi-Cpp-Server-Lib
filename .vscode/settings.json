@@ -5,17 +5,18 @@
   "C_Cpp.intelliSenseEngine": "disabled",
   // clangd 本体参数
   "clangd.arguments": [
-    "--background-index",         // 后台全量索引，Go-to-Def 不需要先打开文件
+    "--background-index",         // 后台全量索引，Go-to-Def / 查找引用不需要先打开文件
     "--clang-tidy",               // 随编辑实时运行 clang-tidy（规则来自 .clang-tidy）
     "--completion-style=detailed",// 补全项显示参数类型
     "--header-insertion=never",   // 不自动插入 #include（C++ 项目中通常更安全）
-    // 注：clangd 22 已移除 --inlay-hints 启动开关（默认开启），由
-    // editor.inlayHints.enabled / clangd.inlayHints.* 控制
-    "--log=error"                 // 减少 clangd 自身的噪音日志
-    // 注：不使用 --query-driver。build/compile_commands.json 已含
-    // -isystem /opt/homebrew/include；--query-driver 同时生效时
-    // Apple SDK 路径与 Homebrew 头文件发生冲突 → fatal_too_many_errors。
-    // 系统头文件遮蔽问题已由 .clangd 的 -resource-dir 指向 AppleClang/clang/21 解决。
+    "--log=error",                // 减少 clangd 自身的噪音日志
+    // ── 跨平台关键：--query-driver ──────────────────────────────────────────
+    // 让 clangd 直接“询问” compile_commands.json 里记录的真实编译器，
+    // 自动获取该机器正确的系统头文件搜索路径与 resource-dir。
+    // 这样无论是 macOS（Apple CommandLineTools / Xcode / Homebrew clang）
+    // 还是 Linux（gcc / clang），都无需在 .clangd 里硬编码任何 -resource-dir。
+    // allowlist 覆盖 mac 与 linux 常见的编译器安装位置：
+    "--query-driver=/usr/bin/c++,/usr/bin/cc,/usr/bin/clang*,/usr/bin/g++,/usr/bin/gcc,/usr/local/bin/*,/opt/homebrew/bin/*,/Library/Developer/CommandLineTools/usr/bin/*,/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/*"
   ],
   // ── cmake-tools ──────────────────────────────────────────────────────────
   "cmake.buildDirectory": "${workspaceFolder}/build",
